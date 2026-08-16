@@ -381,3 +381,110 @@ The session was interrupted by an API limit between this run and the next
 phase. On resuming, the cluster was still healthy and the heartbeat had been
 advancing unattended for about two hours (1273 beats, newest 12:08:51 UTC),
 which is its own small piece of evidence that nothing here needs babysitting.
+
+### 2026-08-16T14:11:00+02:00 — health verified against the live cluster
+
+`./green health` from the deployment, resolving the real pushed pin
+(`58f66bd`), exit 0. Green discards a successful play's stdout, so the same
+script was run directly on each member for the record:
+
+```
+mysql-ha health — mysql-ha-node-1 (2026-08-16T12:10:46Z)
+  PASS  group-online             3 of 3 members ONLINE
+  PASS  group-primary            1 primary in the group view
+  PASS  member-state             this member is ONLINE (PRIMARY)
+  PASS  replication-streaming    proposed 2570 transactions to the group
+  PASS  heartbeat                5s old on this member
+  PASS  endpoint-dns             my-ha.bigconfig.space resolves to 167.99.17.140 (reserved 167.99.17.140)
+  PASS  endpoint-assignment      reserved IP held by droplet 592773927, primary is 592773927
+  PASS  snapshot                 20260816T082002Z is 3h old
+  PASS  binlog-archive           1 binary-log objects touched in the last 10 minutes
+  PASS  binlog-archive-total     1 binary logs archived for this member
+  PASS  restore-verified         3h ago: restored 20260816T082002Z and replayed 1 archived logs
+  0 failed check(s) on mysql-ha-node-1
+```
+
+Nodes two and three: identical, `applied 2572 remote transactions, 0 queued`
+and `applied 2570 remote transactions, 0 queued` respectively, heartbeat 8s and
+10s old. Zero failed checks on all three.
+
+The heartbeat check is per-member on purpose: a heartbeat that is five seconds
+old *on a secondary* is a statement about replication actually arriving there,
+not about the primary accepting writes.
+
+### 2026-08-16T14:12:51+02:00 — failover exercised for real
+
+Not a switchover. `systemctl kill -s SIGKILL mysql.service` on the primary, so
+the member never got to leave the group politely.
+
+```
+T+0    killing mysqld on mysql-ha-node-1 (droplet 592773927) with SIGKILL
+T+23s  new primary elected: mysql-ha-node-3 (PRIMARY, server_id 103)
+T+36s  reserved IP 167.99.17.140 now held by droplet: mysql-ha-node-3
+T+43s  my-ha.bigconfig.space now serves: 10.133.0.4 server_id=103 super_read_only=0
+```
+
+The last line is from a MySQL client on the operator's machine connecting to
+`my-ha.bigconfig.space` by name — not from inside the cluster — and
+`super_read_only=0` means it is the writable primary, not a secondary that
+happens to accept connections.
+
+Before the kill, the same query through the same name returned
+`10.133.0.3 server_id=101`. The DNS record did not change and was never
+touched; the address moved.
+
+Budget: ~23s is Group Replication's own failure detection and election on a
+three-member group, and ~20s more is the ten-second endpoint timer plus the
+DigitalOcean unassign/assign round trip. Nothing here is tuned for a record —
+the poll interval is desired state (`endpoint-poll-interval`) and could be
+shortened.
+
+Bringing the killed member back was one command and no coordination:
+
+```
+$ systemctl start mysql.service
+  node-1 state: ONLINE
+```
+
+It rejoined by itself within five seconds, as a secondary, because
+`zz-colors-ha-boot.cnf` turns `group_replication_start_on_boot` on once the
+group exists. No `create`, no playbook, no operator decision.
+
+### 6 — converging an already-live cluster: ERROR 1290 on the secondaries (1 attempt to fix)
+
+Found by the run that was supposed to be the final one — `./green create`
+against a healthy, already-converged cluster, resolving the real pushed pin:
+
+```
+TASK [Create the replication account on every member]
+fatal: [mysql-ha-node-1]: FAILED! => {"msg": "ERROR 1290 (HY000) at line 2: The
+  MySQL server is running with the --super-read-only option so it cannot
+  execute this statement"}
+fatal: [mysql-ha-node-2]: FAILED! => (same)
+mysql-ha-node-3            : ok=3  changed=1  failed=0
+```
+
+Exactly the two secondaries failed and the primary succeeded — which names the
+cause in one line. The account tasks ran `SET SESSION sql_log_bin = 0` and then
+`CREATE USER`, which is right for a member that has not joined a group yet
+(that is how the accounts exist identically on all three before there *is* a
+group) and impossible on an ONLINE secondary, which is `super_read_only`.
+
+This never showed up before because every previous run started from members
+that were not yet in a group. It is the classic shape of a bug that only
+appears on the *second* converge, and it is why the definition of done includes
+one.
+
+Fixed by making each member do what its role requires, decided inside the
+script so the three cases sit next to the statements they govern:
+
+- **not in the group** — writable, and its accounts must exist before it joins:
+  create them locally with the binary log off, as before;
+- **ONLINE SECONDARY** — do nothing and say so; the accounts arrive by
+  replication;
+- **PRIMARY of a live group** — reconcile them with the binary log *on*, so
+  that a rotated password reaches the whole group instead of only one member.
+
+The third case is not just about not failing: without it, changing
+`COLORS_PAR_MYSQL_ADMIN_PASSWORD` and re-converging would have silently done
+nothing at all.

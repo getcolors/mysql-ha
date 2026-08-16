@@ -104,7 +104,7 @@ Layout in `s3://mysql-ha-backup/<prefix>/`:
 snapshot/<UTC ts>/dump.sql.zst
 snapshot/<UTC ts>/meta.json      gtid_executed, binlog coordinates, node, sha256
 snapshot/latest.json             a pointer to the newest complete snapshot
-binlog/<node>/mysql-bin.NNNNNN
+binlog/<node>/binlog.NNNNNN
 restore-check/<UTC ts>.json
 restore-check/latest.json
 ```

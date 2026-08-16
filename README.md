@@ -53,22 +53,38 @@ Nothing about DNS changes: `my-ha.example.com` is an `A` record whose content
 is the reserved IP, forever. Clients keep resolving the same address; the
 address starts arriving at a different droplet.
 
-To exercise it deliberately:
+To exercise it deliberately — `kill`, not `stop`, so the member never gets to
+leave the group politely:
 
 ```sh
-ssh root@node-1.my-ha.example.com systemctl stop mysql
-./green health          # from a member's point of view
+ssh root@node-1.my-ha.example.com systemctl kill -s SIGKILL mysql.service
 ```
 
-Give the endpoint timer up to ~40 seconds and `my-ha.example.com` is served by
-the new primary. Bringing the old member back:
+Measured on a three-member cluster in `ams3`, from the moment the primary's
+mysqld was killed:
+
+| | |
+|---|---|
+| new primary elected | ~23s |
+| reserved IP reassigned | ~36s |
+| `my-ha.example.com` serving the new primary, writable | ~43s |
+
+The first number is Group Replication's own failure detection and election. The
+rest is `endpoint-poll-interval` plus a DigitalOcean unassign/assign round trip,
+so shortening the poll shortens the tail. The DNS record is not involved at any
+point and never changes.
+
+Bringing the old member back is one command and no coordination:
 
 ```sh
 ssh root@node-1.my-ha.example.com systemctl start mysql
 ```
 
-It rejoins by itself — `group_replication_start_on_boot` is on once the group
-exists — and comes back as a secondary.
+It rejoins by itself within seconds, as a secondary, because
+`group_replication_start_on_boot` is on once the group exists.
+
+Running `./green create` after a failover is safe and does **not** move the
+endpoint back: the reserved IP's assignment is deliberately not desired state.
 
 ## Backups
 

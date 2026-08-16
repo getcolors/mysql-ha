@@ -60,11 +60,25 @@
         - gr_online.stdout | trim == '0'
       changed_when: true
 
-    # Both accounts are created with the binary log off, so they exist
-    # identically on every member without travelling through a group that does
-    # not exist yet. The password is escaped in the shell rather than
-    # interpolated by the templating layer, so a quote or a backslash in it is
-    # data instead of syntax.
+    # WHERE AN ACCOUNT IS CREATED DEPENDS ON WHAT THIS MEMBER IS
+    #
+    # A member that has not joined the group yet is writable, and its accounts
+    # must exist before it joins — so they are created locally, with the binary
+    # log off, and never travel through a group that does not exist yet.
+    #
+    # A member that is already an ONLINE SECONDARY is `super_read_only`: any DDL
+    # there is ERROR 1290, and it does not need any, because the accounts reach
+    # it by replication. It does nothing.
+    #
+    # The PRIMARY of a live group reconciles them *with* the binary log on, so
+    # that a rotated password reaches the whole group.
+    #
+    # This is decided inside the script rather than in a `when:`, so that the
+    # three cases are stated once, next to the statements they govern.
+    #
+    # The password is escaped in the shell rather than interpolated by the
+    # templating layer, so a quote or a backslash in it is data instead of
+    # syntax.
     #
     # THE 32-CHARACTER CHANNEL LIMIT
     #
@@ -87,9 +101,15 @@
       ansible.builtin.shell: |
         set -euo pipefail
         esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+        role=$(mysql --protocol=socket --user=root -N -B -e "SELECT COALESCE((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'), 'UNJOINED')")
+        case "$role" in
+          UNJOINED) logbin=0 ;;
+          PRIMARY)  logbin=1 ;;
+          *)        echo "ONLINE ${role}: these accounts arrive by replication"; exit 0 ;;
+        esac
         pw=$(esc "$REPL_PASSWORD")
         mysql --protocol=socket --user=root <<SQL
-        SET SESSION sql_log_bin = 0;
+        SET SESSION sql_log_bin = ${logbin};
         CREATE USER IF NOT EXISTS '<{ mysql-replication-user }>'@'%' IDENTIFIED BY '${pw}';
         ALTER USER '<{ mysql-replication-user }>'@'%' IDENTIFIED BY '${pw}';
         GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN,
@@ -116,9 +136,15 @@
       ansible.builtin.shell: |
         set -euo pipefail
         esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+        role=$(mysql --protocol=socket --user=root -N -B -e "SELECT COALESCE((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'), 'UNJOINED')")
+        case "$role" in
+          UNJOINED) logbin=0 ;;
+          PRIMARY)  logbin=1 ;;
+          *)        echo "ONLINE ${role}: these accounts arrive by replication"; exit 0 ;;
+        esac
         pw=$(esc "$ADMIN_PASSWORD")
         mysql --protocol=socket --user=root <<SQL
-        SET SESSION sql_log_bin = 0;
+        SET SESSION sql_log_bin = ${logbin};
         CREATE USER IF NOT EXISTS '<{ mysql-admin-user }>'@'%' IDENTIFIED BY '${pw}';
         ALTER USER '<{ mysql-admin-user }>'@'%' IDENTIFIED BY '${pw}';
         GRANT ALL PRIVILEGES ON *.* TO '<{ mysql-admin-user }>'@'%' WITH GRANT OPTION;
