@@ -548,3 +548,47 @@ the new one. No operator action, no gap.
 
 A second snapshot (`20260816T121727Z`) was published by this run and verified by
 the same restore check, on a cluster with a different primary than the first.
+
+### 2026-08-16T14:25:30+02:00 — definitive run on the pushed pin
+
+Both repositories at their final commits, the deployment's root launcher a byte
+identical copy of the payload, and the payload carrying `1a6ff96`. `./green
+create` from a clean invocation:
+
+```
+Checking out: https://github.com/getcolors/mysql-ha.git at 1a6ff963ba32c057…
+infrastructure   2.8s
+dns              3.5s
+base            38.8s
+cluster         18.3s
+backup         197.1s
+health           7.6s
+```
+
+No `MYSQL_HA_LIB_ROOT`, no working-tree override: the launcher resolved the
+library from the pushed commit and converged. Then `./green health`, exit 0, and
+the check script on each member individually:
+
+```
+mysql-ha health — mysql-ha-node-1 (2026-08-16T12:25:12Z)  0 failed check(s)
+mysql-ha health — mysql-ha-node-2 (2026-08-16T12:25:15Z)  0 failed check(s)
+mysql-ha health — mysql-ha-node-3 (2026-08-16T12:25:18Z)  0 failed check(s)
+```
+
+Three snapshots are now in the bucket — one from each converge, the second and
+third taken after the failover moved the primary — each with its own verified
+restore. Nothing was torn down; `./green delete` was never run.
+
+## Closing note
+
+Six failed checks over the whole run, every one of them in the half that talks
+to real machines. The offline half — three colours of nothing, one language,
+38 tests, two golden trees and a launcher contract — passed first time and
+never regressed.
+
+That split is the finding I would keep. The design work (which topology, which
+endpoint mechanism, which backup tool) took thought but produced no failures;
+the failures were all *encounters with what the target system actually does* —
+Ansible's task ordering, DigitalOcean's image freshness, MySQL's ERROR 3139,
+ERROR 3056, ERROR 1290. None of them was discoverable by reading, and three of
+them were only reachable by converging twice.
