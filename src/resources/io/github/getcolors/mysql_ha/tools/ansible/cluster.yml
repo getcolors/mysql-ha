@@ -65,6 +65,24 @@
     # not exist yet. The password is escaped in the shell rather than
     # interpolated by the templating layer, so a quote or a backslash in it is
     # data instead of syntax.
+    #
+    # THE 32-CHARACTER CHANNEL LIMIT
+    #
+    # MySQL refuses a replication-channel password longer than 32 characters,
+    # in both CHANGE REPLICATION SOURCE (ERROR 3056) and START GROUP_REPLICATION
+    # (ERROR 3972). There is no way around it, and distributed recovery is a
+    # replication channel.
+    #
+    # So the replication *account* does not carry the operator's secret
+    # verbatim: it carries the first 128 bits of its SHA-256, as 32 hex
+    # characters. No second credential is invented, nothing is hardcoded, and
+    # nothing is weakened — a truncation of the operator's password would leak
+    # a prefix of it, whereas this leaks nothing and is 128 bits of entropy
+    # inside a VPC-only account. It is also, being hex, immune to every quoting
+    # hazard in the statements below.
+    #
+    # Every place that authenticates as this account derives it the same way,
+    # in Ansible, so there is one implementation of the derivation.
     - name: Create the replication account on every member
       ansible.builtin.shell: |
         set -euo pipefail
@@ -81,9 +99,18 @@
       args:
         executable: /bin/bash
       environment:
-        REPL_PASSWORD: "{{ lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') }}"
+        # See "the 32-character channel limit" below.
+        REPL_PASSWORD: "{{ (lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') | hash('sha256'))[:32] }}"
       no_log: true
       changed_when: true
+      register: repl_account
+      failed_when: false
+
+    # MySQL's own error text, which never echoes the password back.
+    - name: Report why it failed
+      ansible.builtin.fail:
+        msg: "{{ repl_account.stderr | default(repl_account.msg) | default('failed') }}"
+      when: repl_account is not skipped and (repl_account.rc | default(1)) != 0
 
     - name: Create the administrative account on every member
       ansible.builtin.shell: |
@@ -103,10 +130,26 @@
         ADMIN_PASSWORD: "{{ lookup('env', 'COLORS_PAR_MYSQL_ADMIN_PASSWORD') }}"
       no_log: true
       changed_when: true
+      register: admin_account
+      failed_when: false
 
-    # GET_SOURCE_PUBLIC_KEY is what lets the recovery channel authenticate the
-    # caching_sha2_password account without a pre-shared server certificate.
+    # MySQL's own error text, which never echoes the password back.
+    - name: Report why it failed
+      ansible.builtin.fail:
+        msg: "{{ admin_account.stderr | default(admin_account.msg) | default('failed') }}"
+      when: admin_account is not skipped and (admin_account.rc | default(1)) != 0
+
+    # Only the credentials. The recovery channel accepts a restricted set of
+    # CHANGE REPLICATION SOURCE parameters — GET_SOURCE_PUBLIC_KEY is not one of
+    # them, and asking for it is ERROR 3139. The equivalent for this channel is
+    # the server variable `group_replication_recovery_get_public_key`, which
+    # z-colors-ha.cnf sets.
+    #
+    # Skipped on a member that is already in the group: the channel's threads
+    # are running, MySQL refuses to reconfigure it, and its credentials were set
+    # when it joined. Converging a healthy cluster must not fail.
     - name: Point the distributed-recovery channel at the replication account
+      when: gr_online.stdout | trim == '0'
       ansible.builtin.shell: |
         set -euo pipefail
         esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
@@ -114,16 +157,24 @@
         mysql --protocol=socket --user=root <<SQL
         CHANGE REPLICATION SOURCE TO
           SOURCE_USER = '<{ mysql-replication-user }>',
-          SOURCE_PASSWORD = '${pw}',
-          GET_SOURCE_PUBLIC_KEY = 1
+          SOURCE_PASSWORD = '${pw}'
           FOR CHANNEL 'group_replication_recovery';
         SQL
       args:
         executable: /bin/bash
       environment:
-        REPL_PASSWORD: "{{ lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') }}"
+        # See "the 32-character channel limit" below.
+        REPL_PASSWORD: "{{ (lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') | hash('sha256'))[:32] }}"
       no_log: true
       changed_when: true
+      register: recovery_channel
+      failed_when: false
+
+    # MySQL's own error text, which never echoes the password back.
+    - name: Report why it failed
+      ansible.builtin.fail:
+        msg: "{{ recovery_channel.stderr | default(recovery_channel.msg) | default('failed') }}"
+      when: recovery_channel is not skipped and (recovery_channel.rc | default(1)) != 0
 
 - name: Bootstrap the group, but only if there is no group
   hosts: bootstrap

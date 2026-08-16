@@ -192,6 +192,32 @@ returns that region's default VPC), never a resource.
   agents authenticate to their own mysqld as `root@localhost` over the unix
   socket with `auth_socket`, which is how Ubuntu's package ships it — so the
   admin password is never written to any node.
+
+## 9. The 32-character replication-channel limit
+
+MySQL refuses a replication-channel password longer than 32 characters —
+`ERROR 3056` from `CHANGE REPLICATION SOURCE TO`, `ERROR 3972` from
+`START GROUP_REPLICATION ... PASSWORD=`. Both were probed on a live server;
+nothing avoids it, and distributed recovery *is* a replication channel.
+
+The `admin` account is unaffected: a normal MySQL account has no such limit and
+carries `COLORS_PAR_MYSQL_ADMIN_PASSWORD` verbatim.
+
+The `repl` account cannot. Rather than ask for a third credential, or truncate
+the operator's secret — which would put a prefix of it into `mysql.user` and
+into an option file on every member — the account's password is the first 128
+bits of `SHA-256(COLORS_PAR_MYSQL_REPLICATION_PASSWORD)`, rendered as 32 hex
+characters.
+
+The operator still supplies exactly one replication secret. The package adapts
+it to a protocol field whose width it does not control, in a way that reveals
+nothing about the input, keeps 128 bits of entropy on an account that is only
+reachable inside the VPC, and — being hex — cannot be misread as syntax by any
+of the SQL statements or option files it passes through.
+
+The derivation appears once, as an Ansible expression, and both consumers (the
+`CREATE`/`ALTER USER` statements and the archiver's `binlog-client.cnf`) read
+that one expression, so they cannot drift apart.
 - `compute-prevent-destroy` renders into every destroyable resource.
 - Nothing secret is ever rendered. Ansible resolves `COLORS_PAR_*` at play time
   with `lookup('env', ...)` under `no_log`.

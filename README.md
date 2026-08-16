@@ -194,6 +194,18 @@ member authenticate to their own server as `root@localhost` over the unix
 socket, the way Ubuntu ships it, so the admin password is never written to a
 member at all.
 
+One thing to know about the second one: MySQL refuses a replication-channel
+password longer than 32 characters, and distributed recovery is a replication
+channel. Rather than ask for a third credential or truncate yours, the `repl`
+account carries the first 128 bits of your value's SHA-256, as hex. If you ever
+connect as `repl` by hand, that is the string:
+
+```sh
+printf '%s' "$COLORS_PAR_MYSQL_REPLICATION_PASSWORD" | sha256sum | cut -c1-32
+```
+
+`admin` carries `COLORS_PAR_MYSQL_ADMIN_PASSWORD` exactly as you set it.
+
 ## Development
 
 ```sh

@@ -5,16 +5,27 @@
 - name: Prepare the MySQL cluster members
   hosts: mysql
   become: true
-  gather_facts: true
+  # Deliberately false. Fact gathering runs *before* pre_tasks, so a play that
+  # gathers facts cannot also wait for the host to exist — it fails on a droplet
+  # that is forty seconds old and still booting. Nothing here reads a fact.
+  gather_facts: false
   any_errors_fatal: true
 
   pre_tasks:
-    - name: Wait for SSH and cloud-init after parallel provisioning
+    - name: Wait for SSH after parallel provisioning
       ansible.builtin.wait_for_connection:
         connect_timeout: 10
-        delay: 5
+        delay: 10
         sleep: 5
         timeout: 900
+
+    # apt on a freshly booted DigitalOcean droplet races cloud-init and
+    # unattended-upgrades for the dpkg lock, and the apt module does not retry
+    # on a lock. Waiting is cheaper than retrying.
+    - name: Wait for cloud-init to finish before touching apt
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
 
   handlers:
     # Defined before the MySQL handler on purpose: Ansible runs handlers in
@@ -42,10 +53,18 @@
           - ca-certificates
           - apparmor-utils
         state: present
+        # No cache_valid_time. The DigitalOcean image ships an index that is
+        # young enough to look fresh and old enough to name package versions
+        # that have already been superseded in the pool — which fails as a 404
+        # on the .deb, not as a resolution error, so it survives every retry.
+        # Always refresh.
         update_cache: true
-        cache_valid_time: 3600
       environment:
         DEBIAN_FRONTEND: noninteractive
+      register: mysql_ha_apt
+      until: mysql_ha_apt is success
+      retries: 5
+      delay: 20
 
     - name: Record the versions this cluster is actually running
       ansible.builtin.command: "{{ item }} --version"

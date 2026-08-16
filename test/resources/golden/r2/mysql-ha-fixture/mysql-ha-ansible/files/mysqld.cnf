@@ -54,6 +54,13 @@ group_replication_enforce_update_everywhere_checks = OFF
 # is the server saying it as well.
 group_replication_ip_allowlist = "10.110.0.0/20"
 
+# The replication account uses caching_sha2_password, MySQL 8's default. Over a
+# connection with no server certificate the client has to fetch the server's
+# RSA public key first, and for the recovery channel that is this variable —
+# CHANGE REPLICATION SOURCE TO ... GET_SOURCE_PUBLIC_KEY is rejected on this
+# channel with ERROR 3139.
+group_replication_recovery_get_public_key = ON
+
 # Bootstrapping is an explicit, one-time act performed by the cluster playbook
 # after it has confirmed no member is ONLINE anywhere. It is never a startup
 # default, because a server that bootstraps on boot is a server that forms a

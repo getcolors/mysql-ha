@@ -72,6 +72,14 @@ Local agents authenticate as `root@localhost` over the unix socket with
 `auth_socket`, so the admin password is never written to a member. Do not add
 a third credential; solve it another way or report it.
 
+**The `repl` account's password is derived, not verbatim.** MySQL rejects a
+replication-channel password over 32 characters (`ERROR 3056`/`ERROR 3972`), so
+the account carries `SHA-256(COLORS_PAR_MYSQL_REPLICATION_PASSWORD)[:32]` in
+hex. The derivation is one Ansible expression, read by both the `ALTER USER`
+statements in `cluster.yml` and `binlog-client.cnf` in `backup.yml`. Change it
+in one place or not at all, and never truncate the operator's secret instead —
+that would put a prefix of it on every member. `admin` is unaffected.
+
 Public ingress is SSH from `digitalocean-ssh-sources` and the MySQL port from
 `digitalocean-client-sources`. The group port (33061) is VPC-only in both the
 firewall and `group_replication_ip_allowlist`.

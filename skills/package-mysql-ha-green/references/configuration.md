@@ -65,8 +65,32 @@ reserved IP, which never changes. Per-member administrative records
 | `mysql-group-port` | Group Replication port, normally `33061`. VPC-only. Must differ from `mysql-port`. |
 | `mysql-group-name` | a **UUID**. MySQL rejects anything else as a group name. Generate one per deployment and never change it on a live cluster. |
 | `mysql-admin-user` | the account clients use; its password is `COLORS_PAR_MYSQL_ADMIN_PASSWORD` |
-| `mysql-replication-user` | used by distributed recovery and by the binary-log archiver; its password is `COLORS_PAR_MYSQL_REPLICATION_PASSWORD` |
+| `mysql-replication-user` | used by distributed recovery and by the binary-log archiver; see the note below |
 | `mysql-innodb-buffer-pool-size` | e.g. `1G`. Leave room for the verification instance's 128 MB. |
+
+### The replication account's password is derived, not verbatim
+
+MySQL refuses a replication-channel password longer than 32 characters
+(`ERROR 3056` from `CHANGE REPLICATION SOURCE TO`, `ERROR 3972` from
+`START GROUP_REPLICATION`), and distributed recovery is a replication channel.
+
+So the `repl` account does **not** carry
+`COLORS_PAR_MYSQL_REPLICATION_PASSWORD` verbatim. It carries the first 128 bits
+of that value's SHA-256, as 32 hex characters:
+
+```
+password = SHA256(COLORS_PAR_MYSQL_REPLICATION_PASSWORD)[:32]   # hex
+```
+
+You still supply one replication secret and only one. But if you ever connect
+as `repl` by hand, that is the string to use, and you can reproduce it with:
+
+```sh
+printf '%s' "$COLORS_PAR_MYSQL_REPLICATION_PASSWORD" | sha256sum | cut -c1-32
+```
+
+The `admin` account is unaffected — a normal MySQL account has no such limit and
+carries `COLORS_PAR_MYSQL_ADMIN_PASSWORD` exactly as you set it.
 
 ## Backups
 

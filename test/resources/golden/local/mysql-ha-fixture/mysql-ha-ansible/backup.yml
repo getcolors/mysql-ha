@@ -54,7 +54,10 @@
         content: |
           [client]
           user = repl
-          password = {{ lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') }}
+          # The derived channel-width secret, not the operator's password — see
+          # "the 32-character channel limit" in cluster.yml. Hex, so it needs no
+          # quoting in a MySQL option file either.
+          password = {{ (lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') | hash('sha256'))[:32] }}
 
           [mysqlbinlog]
           get-server-public-key
@@ -330,26 +333,30 @@
 
   tasks:
     # Every member runs it; all but the backup owner return in milliseconds.
+    # `systemctl start` on a Type=oneshot unit blocks until it is done.
     - name: Run the snapshot job
-      ansible.builtin.systemd_service:
-        name: mysql-ha-snapshot.service
-        state: restarted
+      ansible.builtin.command: systemctl start mysql-ha-snapshot.service
       register: snapshot_run
+      changed_when: true
+      failed_when: false
 
-    - name: Wait for the snapshot job to finish
-      ansible.builtin.command: systemctl is-active mysql-ha-snapshot.service
-      register: snapshot_state
-      until: snapshot_state.stdout | trim != 'activating'
-      retries: 120
-      delay: 5
-      changed_when: false
-      failed_when: snapshot_state.stdout | trim not in ['inactive', 'failed'] and snapshot_state.rc == 0
-
-    - name: The snapshot job succeeded
+    - name: How did it end
       ansible.builtin.command: systemctl show -p Result --value mysql-ha-snapshot.service
       register: snapshot_result
       changed_when: false
-      failed_when: snapshot_result.stdout | trim != 'success'
+
+    # Without this, a failed snapshot surfaces as "Job for … failed" and the
+    # reason stays on the member. Print the journal where the run can see it.
+    - name: Why it failed
+      ansible.builtin.command: journalctl -u mysql-ha-snapshot.service -n 60 --no-pager
+      register: snapshot_journal
+      changed_when: false
+      when: snapshot_result.stdout | trim != 'success'
+
+    - name: Report the failure
+      ansible.builtin.fail:
+        msg: "{{ snapshot_journal.stdout_lines }}"
+      when: snapshot_result.stdout | trim != 'success'
 
 - name: Verify the published backup can be restored
   hosts: mysql
@@ -366,21 +373,39 @@
         seconds: 90
 
     - name: Run the verified restore
-      ansible.builtin.systemd_service:
-        name: mysql-ha-restore-check.service
-        state: restarted
+      ansible.builtin.command: systemctl start mysql-ha-restore-check.service
+      register: restore_run
+      changed_when: true
+      failed_when: false
 
-    - name: Wait for the verified restore to finish
-      ansible.builtin.command: systemctl is-active mysql-ha-restore-check.service
-      register: restore_state
-      until: restore_state.stdout | trim != 'activating'
-      retries: 120
-      delay: 5
-      changed_when: false
-      failed_when: restore_state.stdout | trim not in ['inactive', 'failed'] and restore_state.rc == 0
-
-    - name: The verified restore passed
+    - name: How did it end
       ansible.builtin.command: systemctl show -p Result --value mysql-ha-restore-check.service
       register: restore_result
       changed_when: false
-      failed_when: restore_result.stdout | trim != 'success'
+
+    - name: Why it failed
+      ansible.builtin.command: journalctl -u mysql-ha-restore-check.service -n 80 --no-pager
+      register: restore_journal
+      changed_when: false
+      when: restore_result.stdout | trim != 'success'
+
+    - name: Report the failure
+      ansible.builtin.fail:
+        msg: "{{ restore_journal.stdout_lines }}"
+      when: restore_result.stdout | trim != 'success'
+
+    - name: The published verdict
+      ansible.builtin.command: >-
+        rclone --config /etc/mysql-ha/rclone.conf cat
+        r2:{{ backup_bucket }}/{{ backup_prefix }}/restore-check/latest.json
+      vars:
+        backup_bucket: "fixture-backup"
+        backup_prefix: "mysql-ha-fixture"
+      register: restore_verdict
+      changed_when: false
+      failed_when: false
+
+    - name: Show it
+      ansible.builtin.debug:
+        msg: "{{ restore_verdict.stdout }}"
+      when: restore_verdict.stdout | default('') | length > 0
