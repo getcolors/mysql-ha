@@ -3,6 +3,29 @@
 Running log for the `mysql-ha` benchmark run. Written as the work happened, not
 retrospectively. Timestamps are ISO-8601 local (Europe/Rome, UTC+02:00).
 
+**How to read it.** Entries were appended in the order things happened, and not
+reordered afterwards, so the later phase entries sit *below* the failed-check
+section rather than with the earlier ones. Two entries are out of sequence
+because I wrote them out of sequence, and that is left as it is. The session was
+also interrupted once by an API limit, which is noted where it falls.
+
+The failed checks are the difficulty signal and each one is written up where it
+happened. Index, for orientation only — the detail is below and is not a
+summary:
+
+| # | Where | What | Attempts to fix |
+|---|---|---|---|
+| 1 | `devenv shell` | nixpkgs removed `mysql-client` | 1 |
+| 2 | first real `create`, `base.yml` | `gather_facts` runs before `pre_tasks`, so the SSH wait never ran | 1 |
+| 3 | `base.yml` | the image's apt index names package versions already gone from the pool | 1 (after 5 useless retries) |
+| 4 | `cluster.yml` | the recovery channel rejects `GET_SOURCE_PUBLIC_KEY` | 1, plus 1 to fix the fix |
+| 5 | `cluster.yml` | MySQL refuses a replication password over 32 characters | 1 |
+| 6 | second `create` | account DDL is `ERROR 1290` on a `super_read_only` secondary | 1 |
+
+Six failures, all diagnosed and fixed; none needed more than one real attempt
+once the cause was visible, and the one that cost the most (4) cost it because
+`no_log` had hidden the error — which is itself recorded as a fix.
+
 ## Phase log
 
 ### 2026-08-16T09:30:04+02:00 — design
@@ -488,3 +511,40 @@ script so the three cases sit next to the statements they govern:
 The third case is not just about not failing: without it, changing
 `COLORS_PAR_MYSQL_ADMIN_PASSWORD` and re-converging would have silently done
 nothing at all.
+
+### 2026-08-16T14:20:00+02:00 — convergence on a live, post-failover cluster
+
+`./green create` again, this time against the cluster as the failover left it:
+node-3 primary, node-1 recently restarted and rejoined. All stages passed.
+
+```
+infrastructure  2.6s
+dns             4.3s
+base           32.0s
+cluster        19.5s
+backup        198.0s
+health          7.4s
+```
+
+Two things this run establishes that the first one could not.
+
+**The endpoint does not snap back.** `infrastructure` and `dns` both re-applied,
+and afterwards the reserved IP was still held by `mysql-ha-node-3` — the primary
+the failover elected, not the one desired state was first created against. That
+is the whole point of creating `digitalocean_reserved_ip` without a
+`droplet_id`, and it is now a measurement rather than an argument.
+
+**The archiver survives a member restart on its own.** Node-1's mysqld was
+SIGKILLed and restarted during the failover, which rotated its binary log. Its
+archiver resumed by itself:
+
+```
+2026-08-16T12:11:39Z mysql-ha-binlog-archive: streaming from binlog.000001
+/var/lib/mysql-ha/binlog/: binlog.000001  binlog.000002
+```
+
+It resumed from the newest file it already had and followed the rotation into
+the new one. No operator action, no gap.
+
+A second snapshot (`20260816T121727Z`) was published by this run and verified by
+the same restore check, on a cluster with a different primary than the first.
