@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — one GTID-stamped logical snapshot to R2.
+#
+# Runs on every member on the same schedule; all but the backup owner exit
+# immediately. The owner is an ONLINE secondary whenever the group has one, so
+# the primary never holds the consistent-read snapshot open.
+#
+# Only user schemas are dumped. Restoring `mysql` into a running server would
+# overwrite the accounts of the server being restored into, which is precisely
+# what the verified restore must not do.
+set -euo pipefail
+set -o pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+
+owns_backup_role || { log "not the backup owner for this cycle"; exit 0; }
+
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+work=$(mktemp -d "${MYSQL_HA_STATE}/tmp/snapshot.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+gtid=$(q "SELECT @@GLOBAL.gtid_executed" | tr '\n' ' ')
+schemas=$(q "SELECT SCHEMA_NAME FROM information_schema.schemata
+             WHERE SCHEMA_NAME NOT IN
+                   ('mysql','sys','performance_schema','information_schema')
+             ORDER BY SCHEMA_NAME" | tr '\n' ' ')
+
+if [ -z "${schemas// /}" ]; then
+  log "no user schemas to snapshot"
+  exit 1
+fi
+
+log "dumping schemas:${schemas}"
+# shellcheck disable=SC2086
+mysqldump --protocol=socket --user=root \
+  --single-transaction --set-gtid-purged=ON \
+  --routines --triggers --events --hex-blob --no-tablespaces \
+  --databases $schemas \
+  | zstd -3 -q -o "$work/dump.sql.zst"
+
+sha=$(sha256sum "$work/dump.sql.zst" | cut -d' ' -f1)
+bytes=$(stat -c%s "$work/dump.sql.zst")
+
+cat > "$work/meta.json" <<EOF
+{
+  "snapshot": "${ts}",
+  "node": "${NODE_NAME}",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "gtid_executed": "${gtid}",
+  "schemas": "${schemas% }",
+  "sha256": "${sha}",
+  "bytes": ${bytes}
+}
+EOF
+
+rc copy "$work/dump.sql.zst" "$(remote)/snapshot/${ts}/"
+rc copy "$work/meta.json" "$(remote)/snapshot/${ts}/"
+
+# latest.json is written last and only on success, so a reader can never be
+# pointed at a snapshot whose dump did not finish uploading.
+rc copyto "$work/meta.json" "$(remote)/snapshot/latest.json"
+log "snapshot ${ts} published (${bytes} bytes)"
+
+# Retention runs here rather than in the one-minute upload timer: it is a daily
+# concern and a LIST against the whole prefix every sixty seconds is not.
+rc delete --min-age "${BACKUP_RETENTION_DAYS}d" "$(remote)/snapshot/" || true
+rc delete --min-age "${BACKUP_RETENTION_DAYS}d" "$(remote)/binlog/" || true
+rc delete --min-age "${BACKUP_RETENTION_DAYS}d" "$(remote)/restore-check/" || true

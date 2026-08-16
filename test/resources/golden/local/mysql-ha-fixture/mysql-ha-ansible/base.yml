@@ -1,0 +1,147 @@
+---
+# Install and configure MySQL on every member. Nothing here forms a group:
+# after this play each server is a correctly configured, independent MySQL that
+# has never joined anything.
+- name: Prepare the MySQL cluster members
+  hosts: mysql
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Wait for SSH and cloud-init after parallel provisioning
+      ansible.builtin.wait_for_connection:
+        connect_timeout: 10
+        delay: 5
+        sleep: 5
+        timeout: 900
+
+  handlers:
+    # Defined before the MySQL handler on purpose: Ansible runs handlers in
+    # definition order, and reloading the profile after restarting the server
+    # it confines would confine nothing until the next restart.
+    - name: Reload the MySQL AppArmor profile
+      ansible.builtin.command: apparmor_parser -r /etc/apparmor.d/usr.sbin.mysqld
+      changed_when: true
+
+    - name: Restart MySQL
+      ansible.builtin.systemd_service:
+        name: mysql
+        state: restarted
+
+  tasks:
+    - name: Install the server and everything the agents shell out to
+      ansible.builtin.apt:
+        name:
+          - mysql-server
+          - mysql-client
+          - rclone
+          - zstd
+          - jq
+          - curl
+          - ca-certificates
+          - apparmor-utils
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Record the versions this cluster is actually running
+      ansible.builtin.command: "{{ item }} --version"
+      loop:
+        - mysqld
+        - rclone
+        - mysqlbinlog
+      register: mysql_ha_versions
+      changed_when: false
+
+    - name: Report them
+      ansible.builtin.debug:
+        msg: "{{ mysql_ha_versions.results | map(attribute='stdout_lines') | map('first') | list }}"
+
+    # Group mysql, because the verification instance reads verify.cnf from here
+    # and mysqld drops to that user. Nothing world-readable ever lands in it.
+    - name: Create the agent configuration directory
+      ansible.builtin.file:
+        path: /etc/mysql-ha
+        state: directory
+        owner: root
+        group: mysql
+        mode: "0750"
+
+    - name: Create the agent state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: mysql
+        group: mysql
+        mode: "0750"
+      loop:
+        - /var/lib/mysql-ha
+        - /var/lib/mysql-ha/binlog
+        - /var/lib/mysql-ha/tmp
+        - /var/lib/mysql-ha/verify
+
+    - name: Install the non-secret node facts
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/files/node.env"
+        dest: /etc/mysql-ha/node.env
+        owner: root
+        group: mysql
+        mode: "0640"
+
+    - name: Extend the MySQL AppArmor profile for the verification instance
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/apparmor-local"
+        dest: /etc/apparmor.d/local/usr.sbin.mysqld
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload the MySQL AppArmor profile
+
+    - name: Install the cluster server configuration
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/files/mysqld.cnf"
+        dest: /etc/mysql/mysql.conf.d/z-colors-ha.cnf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart MySQL
+
+    - name: Install the verification instance configuration
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/verify.cnf"
+        dest: /etc/mysql-ha/verify.cnf
+        owner: root
+        group: mysql
+        mode: "0640"
+
+    - name: Apply configuration changes before anything depends on them
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure MySQL is enabled and running
+      ansible.builtin.systemd_service:
+        name: mysql
+        enabled: true
+        state: started
+
+    - name: Wait for the local server to answer
+      ansible.builtin.command: mysqladmin --protocol=socket --user=root ping
+      register: mysql_ha_ping
+      until: mysql_ha_ping.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Confirm the settings Group Replication cannot start without
+      ansible.builtin.shell: |
+        set -o pipefail
+        mysql --protocol=socket --user=root -N -B -e \
+          "SELECT CONCAT_WS(' ', @@gtid_mode, @@enforce_gtid_consistency,
+                                 IF(@@log_replica_updates,'ON','OFF'), @@binlog_format)"
+      args:
+        executable: /bin/bash
+      register: mysql_ha_settings
+      changed_when: false
+      failed_when: mysql_ha_settings.stdout is not search('ON ON ON ROW')

@@ -1,0 +1,51 @@
+# Golden fixture. Documentation-range addresses and an example zone only; this
+# is never pointed at anything real.
+profile: mysql-ha-fixture
+workdir: .colors
+
+provider-compute: digitalocean
+provider-dns: cloudflare
+provider-backend: local
+
+compute-prevent-destroy: true
+
+cluster-host: my-ha.fixture.example
+cluster-nodes: 3
+
+digitalocean-name: fixture
+digitalocean-region: ams3
+digitalocean-size: s-2vcpu-4gb
+digitalocean-image: ubuntu-24-04-x64
+digitalocean-ssh-keys: "12345678"
+digitalocean-ssh-private-key: ~/.ssh/id_ed25519
+digitalocean-ssh-sources:
+  - 203.0.113.7/32
+digitalocean-client-sources:
+  - 203.0.113.7/32
+digitalocean-vpc-mode: default
+
+cloudflare-zone: fixture.example
+cloudflare-proxied: false
+
+mysql-port: 3306
+mysql-group-port: 33061
+mysql-group-name: 9f8c1d7e-0e6a-4c2b-9a54-6f1b2c3d4e5f
+mysql-admin-user: admin
+mysql-replication-user: repl
+mysql-innodb-buffer-pool-size: 1G
+
+backup-r2-bucket: fixture-backup
+backup-r2-endpoint: https://fixture.r2.cloudflarestorage.com
+backup-r2-region: auto
+backup-r2-prefix: mysql-ha-fixture
+backup-snapshot-oncalendar: "*-*-* 01:00:00"
+backup-restore-check-oncalendar: "*-*-* 02:30:00"
+backup-binlog-upload-interval: 1min
+backup-retention-days: 14
+backup-restore-max-lag-seconds: 900
+
+heartbeat-interval: 10s
+endpoint-poll-interval: 10s
+
+r2-bucket: fixture-state
+r2-endpoint: https://fixture.r2.cloudflarestorage.com

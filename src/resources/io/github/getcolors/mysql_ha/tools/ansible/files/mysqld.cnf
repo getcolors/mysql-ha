@@ -1,0 +1,71 @@
+# Managed by Colors mysql-ha. Do not edit on the host; change colors.yml.
+#
+# Read after Ubuntu's own mysqld.cnf because of the leading `z-`, so every
+# setting here wins.
+[mysqld]
+
+# --- identity ---------------------------------------------------------------
+# server_id is derived from the member ordinal, so it survives a rebuild.
+server_id                = {{ server_id }}
+report_host              = {{ private_ip }}
+report_port              = <{ mysql-port }>
+port                     = <{ mysql-port }>
+bind_address             = 0.0.0.0
+mysqlx                   = OFF
+
+# Everything this cluster timestamps — the heartbeat above all — is compared
+# against UTC by the restore check, so the server must not be in local time.
+default_time_zone        = '+00:00'
+
+# --- GTID and binary logging ------------------------------------------------
+# Group Replication requires all four. They are also what makes point-in-time
+# recovery work: the archived binary logs replay by GTID, so a replay that
+# overlaps the snapshot is skipped rather than duplicated.
+gtid_mode                = ON
+enforce_gtid_consistency = ON
+binlog_format            = ROW
+log_replica_updates      = ON
+log_bin                  = /var/log/mysql/binlog
+relay_log_recovery       = ON
+
+# Local binary logs are a spool, not the archive: `mysql-ha-binlog-archive`
+# streams them to R2 continuously, so the server only has to keep enough for a
+# member to rejoin and for the archiver to catch up after a restart.
+binlog_expire_logs_seconds = 259200
+
+# --- durability -------------------------------------------------------------
+innodb_buffer_pool_size        = <{ mysql-innodb-buffer-pool-size }>
+innodb_flush_log_at_trx_commit = 1
+sync_binlog                    = 1
+
+# --- Group Replication ------------------------------------------------------
+plugin_load_add = 'group_replication.so'
+
+group_replication_group_name   = "<{ mysql-group-name }>"
+group_replication_local_address = "{{ private_ip }}:<{ mysql-group-port }>"
+group_replication_group_seeds  = "<{ group-seeds }>"
+
+# Single primary: one writer, automatic election, no write-conflict rollbacks
+# for the application to handle.
+group_replication_single_primary_mode              = ON
+group_replication_enforce_update_everywhere_checks = OFF
+
+# The group port never leaves the VPC. The firewall says the same thing; this
+# is the server saying it as well.
+group_replication_ip_allowlist = "<{ vpc_ip_range }>"
+
+# Bootstrapping is an explicit, one-time act performed by the cluster playbook
+# after it has confirmed no member is ONLINE anywhere. It is never a startup
+# default, because a server that bootstraps on boot is a server that forms a
+# second group of one.
+group_replication_bootstrap_group = OFF
+
+# OFF here and turned ON by zz-colors-ha-boot.cnf once the group exists, so
+# that a member which reboots rejoins by itself.
+group_replication_start_on_boot = OFF
+
+# A member that loses the majority stops serving rather than serving stale
+# data, then tries to rejoin on its own.
+group_replication_unreachable_majority_timeout = 30
+group_replication_exit_state_action            = OFFLINE_MODE
+group_replication_autorejoin_tries             = 5

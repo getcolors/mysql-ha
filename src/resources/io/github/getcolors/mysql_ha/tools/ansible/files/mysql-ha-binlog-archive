@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — continuous point-in-time recovery material.
+#
+# `mysqlbinlog --read-from-remote-server --stop-never --raw` is MySQL's own
+# documented binary-log backup: it holds an open replication connection and
+# writes every event into a file named exactly as the source binary log,
+# following rotations for as long as it runs. systemd keeps it running; the
+# one-minute upload timer moves the spool to R2.
+#
+# Every member archives its *own* binary log into its own R2 prefix. In Group
+# Replication every ONLINE member applies and logs every transaction under the
+# same GTID, so any one prefix is a complete recovery source — and three of
+# them mean losing a member does not lose the archive, with no leader election
+# anywhere in the archiver.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+
+mkdir -p "$BINLOG_SPOOL"
+wait_for_mysql 150 || { log "local server never became reachable"; exit 1; }
+
+# Resume from the newest file already spooled. mysqlbinlog rewrites it from the
+# start of the log, so a partially transferred file is replaced rather than
+# appended to and there is no torn boundary.
+resume=$(find "$BINLOG_SPOOL" -maxdepth 1 -type f -name 'binlog.[0-9]*' -printf '%f\n' \
+         2>/dev/null | sort | tail -1)
+
+if [ -z "${resume:-}" ]; then
+  resume=$(q "SHOW BINARY LOGS" | head -1 | cut -f1)
+fi
+
+if [ -z "${resume:-}" ]; then
+  log "the server reports no binary logs"
+  exit 1
+fi
+
+log "streaming from ${resume} into ${BINLOG_SPOOL}"
+exec mysqlbinlog \
+  --defaults-file="$MYSQL_HA_ETC/binlog-client.cnf" \
+  --read-from-remote-server \
+  --host=127.0.0.1 --port="$MYSQL_PORT" \
+  --raw --stop-never \
+  --connection-server-id="$CONNECTION_SERVER_ID" \
+  --result-file="$BINLOG_SPOOL/" \
+  "$resume"

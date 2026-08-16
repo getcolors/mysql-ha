@@ -1,0 +1,19 @@
+{:paths ["test/clj" "test/resources"]
+ :deps {io.github.getcolors/mysql-ha {:local/root "."}}
+ :tasks
+ {test {:doc "Run the Babashka unit suite"
+        :requires ([clojure.test :as t]
+                   [io.github.getcolors.mysql-ha.validate-test]
+                   [io.github.getcolors.mysql-ha.tools-test]
+                   [io.github.getcolors.mysql-ha.workflow-test])
+        :task (let [{:keys [fail error]}
+                    (t/run-tests 'io.github.getcolors.mysql-ha.validate-test
+                                 'io.github.getcolors.mysql-ha.tools-test
+                                 'io.github.getcolors.mysql-ha.workflow-test)]
+                (System/exit (if (pos? (+ fail error)) 1 0)))}
+  golden {:doc "Diff a rendered fixture against the recorded goldens"
+          :task (shell "./scripts/golden.sh")}
+  golden:accept {:doc "Re-record the goldens — inspect the diff first"
+                 :task (shell "./scripts/golden.sh" "--accept")}
+  pin {:doc "Stamp the bundled launcher with this repository's pushed HEAD"
+       :task (load-file "tasks/pin.clj")}}}

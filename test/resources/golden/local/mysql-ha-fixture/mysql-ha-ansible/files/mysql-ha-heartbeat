@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — write one heartbeat on the primary.
+#
+# Two tables, for two different questions:
+#
+#   mysql_ha.heartbeat  one row, overwritten. "How stale is this copy?" — the
+#                       health check reads it on every member, and the restore
+#                       check reads it inside the restored copy.
+#   mysql_ha.beat_log   append-only, pruned to two days. "Did the archived
+#                       binary logs actually contain anything after the
+#                       snapshot?" — which is the only assertion that
+#                       distinguishes a restore from a *point-in-time*
+#                       restore.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+
+is_primary || exit 0
+
+mysql --protocol=socket --user=root <<SQL
+INSERT INTO mysql_ha.heartbeat (id, ts, node) VALUES (1, NOW(6), '${NODE_NAME}')
+  ON DUPLICATE KEY UPDATE ts = NOW(6), node = '${NODE_NAME}';
+INSERT INTO mysql_ha.beat_log (ts, node) VALUES (NOW(6), '${NODE_NAME}');
+DELETE FROM mysql_ha.beat_log WHERE ts < NOW() - INTERVAL 2 DAY;
+SQL
