@@ -51,7 +51,7 @@
 ;; cannot resolve its own library says so rather than inventing a SHA or
 ;; silently falling back to whatever is lying around. `bb pin` refuses to stamp
 ;; a dirty or unpushed HEAD for the same reason.
-(def ^:private mysql-ha-sha nil)
+(def ^:private mysql-ha-sha "3acb886ff0cb8695eaa0accda9630555b8ca1cb8")
 
 (def ^:private mysql-ha-git-url "https://github.com/getcolors/mysql-ha.git")
 (def ^:private green-git-url "https://github.com/getcolors/green.git")
