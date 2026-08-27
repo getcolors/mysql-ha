@@ -37,7 +37,7 @@ import { homedir } from "node:os";
 // directory, which would halt Bun's upward resolution of `package-mysql-ha-red`
 // and break the development symlink at red/red.
 const PINS = {
-  "package-mysql-ha-red": null,
+  "package-mysql-ha-red": "github:getcolors/mysql-ha#878049385bc8baed3adfdb48d13abea0a5c0e3b7",
   "red": "github:getcolors/red#db9bfe61282e2093f4098bf5a6ee0cd10added6e",
 };
 
