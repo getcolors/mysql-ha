@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — claim the client endpoint for this member.
+#
+# The endpoint is a DigitalOcean reserved IP, and the Cloudflare record that
+# names it never changes. Failover therefore moves an address between droplets
+# instead of moving a record between addresses, which is why OpenTofu can keep
+# owning the DNS while the cluster owns the assignment.
+#
+# Runs on every member every <{ endpoint-poll-interval }>. All but the primary
+# exit in the first three lines.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+# shellcheck source=/dev/null
+. "$MYSQL_HA_ETC/secrets.env"
+
+is_primary || exit 0
+
+# ONLINE and PRIMARY is not sufficient on its own: a member that has lost the
+# majority stays PRIMARY in its own stale view. super_read_only is what
+# Group Replication clears only on a member that actually holds the write role.
+[ "$(q 'SELECT @@super_read_only')" = "0" ] || exit 0
+
+api="https://api.digitalocean.com/v2/reserved_ips/${RESERVED_IP}"
+
+do_api() {
+  curl -sS --fail-with-body --max-time 20 \
+    -H "Authorization: Bearer ${DO_TOKEN}" \
+    -H 'Content-Type: application/json' "$@"
+}
+
+holder() { do_api "$api" | jq -r '.reserved_ip.droplet.id // empty'; }
+
+current=$(holder || true)
+[ "$current" = "$DROPLET_ID" ] && exit 0
+
+if [ -n "$current" ]; then
+  log "reserved IP ${RESERVED_IP} is held by droplet ${current}; unassigning"
+  do_api -X POST -d '{"type":"unassign"}' "${api}/actions" >/dev/null
+  for _ in $(seq 1 30); do
+    sleep 2
+    [ -z "$(holder || true)" ] && break
+  done
+fi
+
+log "claiming reserved IP ${RESERVED_IP} for droplet ${DROPLET_ID}"
+do_api -X POST -d "{\"type\":\"assign\",\"droplet_id\":${DROPLET_ID}}" \
+  "${api}/actions" >/dev/null
+
+for _ in $(seq 1 30); do
+  sleep 2
+  if [ "$(holder || true)" = "$DROPLET_ID" ]; then
+    log "reserved IP ${RESERVED_IP} now serves ${NODE_NAME}"
+    exit 0
+  fi
+done
+
+log "reserved IP ${RESERVED_IP} was not confirmed on ${NODE_NAME}"
+exit 1

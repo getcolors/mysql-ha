@@ -1,0 +1,411 @@
+---
+# Install the agents and prove, before this play returns, that the whole backup
+# chain works: a snapshot lands in R2, binary logs are being archived, and a
+# scratch server can be rebuilt from both.
+- name: Install the endpoint, heartbeat, backup and recovery agents
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  tasks:
+    # --- credentials --------------------------------------------------------
+    # These three files are the only place a credential lands on a member, and
+    # none of them is ever rendered into the work directory: they are built
+    # here from the process environment under no_log.
+    - name: Install the DigitalOcean token the endpoint agent needs
+      ansible.builtin.copy:
+        dest: /etc/mysql-ha/secrets.env
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          DO_TOKEN={{ lookup('env', 'COLORS_PAR_DO_TOKEN') }}
+      no_log: true
+
+    - name: Install the backup-bucket rclone remote
+      ansible.builtin.copy:
+        dest: /etc/mysql-ha/rclone.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = {{ lookup('env', 'COLORS_PAR_BACKUP_R2_ACCESS_KEY_ID') }}
+          secret_access_key = {{ lookup('env', 'COLORS_PAR_BACKUP_R2_SECRET_ACCESS_KEY') }}
+          endpoint = <{ backup-r2-endpoint }>
+          region = <{ backup-r2-region }>
+          no_check_bucket = true
+      no_log: true
+
+    - name: Install the option file the binary-log archiver authenticates with
+      ansible.builtin.copy:
+        dest: /etc/mysql-ha/binlog-client.cnf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [client]
+          user = <{ mysql-replication-user }>
+          # The derived channel-width secret, not the operator's password — see
+          # "the 32-character channel limit" in cluster.yml. Hex, so it needs no
+          # quoting in a MySQL option file either.
+          password = {{ (lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') | hash('sha256'))[:32] }}
+
+          [mysqlbinlog]
+          get-server-public-key
+      no_log: true
+
+    # --- agents -------------------------------------------------------------
+    - name: Install the shared helper library
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/mysql-ha-lib"
+        dest: /usr/local/lib/mysql-ha-lib
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the agents
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        owner: root
+        group: root
+        mode: "0750"
+      loop:
+        - mysql-ha-endpoint
+        - mysql-ha-heartbeat
+        - mysql-ha-snapshot
+        - mysql-ha-binlog-archive
+        - mysql-ha-binlog-upload
+        - mysql-ha-restore-check
+        - mysql-ha-health
+
+    # --- units --------------------------------------------------------------
+    - name: Install the endpoint unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-endpoint.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Claim the mysql-ha client endpoint for this member
+          After=mysql.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mysql-ha-endpoint
+      notify: Reload systemd
+
+    - name: Install the endpoint timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-endpoint.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Poll whether this member should hold the client endpoint
+          [Timer]
+          OnBootSec=30s
+          OnUnitActiveSec=<{ endpoint-poll-interval }>
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Install the heartbeat unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-heartbeat.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Write one mysql-ha heartbeat on the primary
+          After=mysql.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mysql-ha-heartbeat
+      notify: Reload systemd
+
+    - name: Install the heartbeat timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-heartbeat.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Keep the mysql-ha heartbeat advancing
+          [Timer]
+          OnBootSec=45s
+          OnUnitActiveSec=<{ heartbeat-interval }>
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Install the binary-log archiver unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-binlog-archive.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Stream this member's binary log for point-in-time recovery
+          After=mysql.service
+          Wants=mysql.service
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/bin/mysql-ha-binlog-archive
+          Restart=always
+          RestartSec=10s
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    - name: Install the binary-log upload unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-binlog-upload.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Move the mysql-ha binary-log spool to object storage
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/mysql-ha-binlog-upload
+      notify: Reload systemd
+
+    - name: Install the binary-log upload timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-binlog-upload.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Bound the point-in-time recovery window by this interval
+          [Timer]
+          OnBootSec=90s
+          OnUnitActiveSec=<{ backup-binlog-upload-interval }>
+          AccuracySec=5s
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Install the snapshot unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-snapshot.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Publish one GTID-stamped mysql-ha snapshot
+          After=mysql.service
+          [Service]
+          Type=oneshot
+          TimeoutStartSec=3600
+          ExecStart=/usr/local/bin/mysql-ha-snapshot
+      notify: Reload systemd
+
+    - name: Install the snapshot timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-snapshot.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Daily mysql-ha snapshot
+          [Timer]
+          OnCalendar=<{ backup-snapshot-oncalendar }>
+          Persistent=true
+          RandomizedDelaySec=60
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Install the restore-check unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-restore-check.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Rebuild a server from the published backup and assert it
+          After=mysql.service
+          [Service]
+          Type=oneshot
+          TimeoutStartSec=3600
+          ExecStart=/usr/local/bin/mysql-ha-restore-check
+      notify: Reload systemd
+
+    - name: Install the restore-check timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/mysql-ha-restore-check.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Daily verified restore of the mysql-ha backup
+          [Timer]
+          OnCalendar=<{ backup-restore-check-oncalendar }>
+          Persistent=true
+          RandomizedDelaySec=60
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Load the units before enabling them
+      ansible.builtin.meta: flush_handlers
+
+    - name: Start the continuous agents
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: restarted
+      loop:
+        - mysql-ha-binlog-archive.service
+
+    - name: Enable the timers
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - mysql-ha-endpoint.timer
+        - mysql-ha-heartbeat.timer
+        - mysql-ha-binlog-upload.timer
+        - mysql-ha-snapshot.timer
+        - mysql-ha-restore-check.timer
+
+# Everything above is installation. Everything below is proof, and it runs on
+# every converge rather than only on the first, because a backup chain that is
+# only tested once is a backup chain that is not tested.
+- name: Prove the backup chain end to end
+  hosts: bootstrap
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Let the heartbeat and the archiver get going
+      ansible.builtin.pause:
+        seconds: 45
+
+    - name: The heartbeat is advancing
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT TIMESTAMPDIFF(SECOND, ts, UTC_TIMESTAMP())
+              FROM mysql_ha.heartbeat WHERE id = 1
+      register: heartbeat_age
+      until: heartbeat_age.rc == 0 and (heartbeat_age.stdout | trim | int) <= 60
+      retries: 12
+      delay: 5
+      changed_when: false
+
+- name: Publish a snapshot now
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    # Every member runs it; all but the backup owner return in milliseconds.
+    # `systemctl start` on a Type=oneshot unit blocks until it is done.
+    - name: Run the snapshot job
+      ansible.builtin.command: systemctl start mysql-ha-snapshot.service
+      register: snapshot_run
+      changed_when: true
+      failed_when: false
+
+    - name: How did it end
+      ansible.builtin.command: systemctl show -p Result --value mysql-ha-snapshot.service
+      register: snapshot_result
+      changed_when: false
+
+    # Without this, a failed snapshot surfaces as "Job for … failed" and the
+    # reason stays on the member. Print the journal where the run can see it.
+    - name: Why it failed
+      ansible.builtin.command: journalctl -u mysql-ha-snapshot.service -n 60 --no-pager
+      register: snapshot_journal
+      changed_when: false
+      when: snapshot_result.stdout | trim != 'success'
+
+    - name: Report the failure
+      ansible.builtin.fail:
+        msg: "{{ snapshot_journal.stdout_lines }}"
+      when: snapshot_result.stdout | trim != 'success'
+
+- name: Verify the published backup can be restored
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    # The restore check asserts that replaying the archive adds heartbeat rows
+    # the snapshot did not have, so there has to be an upload cycle between the
+    # snapshot and the check.
+    - name: Let at least one binary-log upload cycle run after the snapshot
+      ansible.builtin.pause:
+        seconds: 90
+
+    - name: Run the verified restore
+      ansible.builtin.command: systemctl start mysql-ha-restore-check.service
+      register: restore_run
+      changed_when: true
+      failed_when: false
+
+    - name: How did it end
+      ansible.builtin.command: systemctl show -p Result --value mysql-ha-restore-check.service
+      register: restore_result
+      changed_when: false
+
+    - name: Why it failed
+      ansible.builtin.command: journalctl -u mysql-ha-restore-check.service -n 80 --no-pager
+      register: restore_journal
+      changed_when: false
+      when: restore_result.stdout | trim != 'success'
+
+    - name: Report the failure
+      ansible.builtin.fail:
+        msg: "{{ restore_journal.stdout_lines }}"
+      when: restore_result.stdout | trim != 'success'
+
+    - name: The published verdict
+      ansible.builtin.command: >-
+        rclone --config /etc/mysql-ha/rclone.conf cat
+        r2:{{ backup_bucket }}/{{ backup_prefix }}/restore-check/latest.json
+      vars:
+        backup_bucket: "<{ backup-r2-bucket }>"
+        backup_prefix: "<{ backup-prefix }>"
+      register: restore_verdict
+      changed_when: false
+      failed_when: false
+
+    - name: Show it
+      ansible.builtin.debug:
+        msg: "{{ restore_verdict.stdout }}"
+      when: restore_verdict.stdout | default('') | length > 0

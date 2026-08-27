@@ -1,0 +1,70 @@
+# Managed by Colors mysql-ha — shared helpers. Sourced, never executed.
+# shellcheck shell=bash
+
+MYSQL_HA_ETC=/etc/mysql-ha
+MYSQL_HA_STATE=/var/lib/mysql-ha
+BINLOG_SPOOL="$MYSQL_HA_STATE/binlog"
+VERIFY_DIR="$MYSQL_HA_STATE/verify"
+RCLONE_CONF="$MYSQL_HA_ETC/rclone.conf"
+
+# shellcheck source=/dev/null
+. "$MYSQL_HA_ETC/node.env"
+
+log() { printf '%s %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${0##*/}" "$*"; }
+
+# Every agent authenticates to its own server as root@localhost over the unix
+# socket, which Ubuntu's package configures with auth_socket. That is why the
+# admin password never has to be written to any member: an agent running as
+# root already is the local administrator, and an attacker who is root does not
+# need the password either.
+q() { mysql --protocol=socket --user=root -N -B -e "$1"; }
+
+server_uuid() { q "SELECT @@server_uuid"; }
+
+member_role() {
+  q "SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
+     WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'" 2>/dev/null || true
+}
+
+is_primary() { [ "$(member_role 2>/dev/null)" = PRIMARY ]; }
+
+online_members() {
+  q "SELECT COUNT(*) FROM performance_schema.replication_group_members
+     WHERE MEMBER_STATE = 'ONLINE'" 2>/dev/null || echo 0
+}
+
+# Which member owns the backup role right now.
+#
+# The ONLINE SECONDARY with the lowest MEMBER_ID, so the primary is never the
+# one holding a consistent-read snapshot open; the PRIMARY only when the group
+# has no secondary at all. Every member asks this same question of the same
+# replicated view, so exactly one of them gets its own uuid back. No lease, no
+# lock, no coordinator, and nothing to go stale.
+backup_owner() {
+  q "SELECT COALESCE(
+       (SELECT MIN(MEMBER_ID) FROM performance_schema.replication_group_members
+          WHERE MEMBER_STATE = 'ONLINE' AND MEMBER_ROLE = 'SECONDARY'),
+       (SELECT MIN(MEMBER_ID) FROM performance_schema.replication_group_members
+          WHERE MEMBER_STATE = 'ONLINE' AND MEMBER_ROLE = 'PRIMARY'),
+       '')" 2>/dev/null || true
+}
+
+owns_backup_role() {
+  local owner me
+  owner=$(backup_owner) || return 1
+  me=$(server_uuid) || return 1
+  [ -n "$owner" ] && [ "$owner" = "$me" ]
+}
+
+rc() { rclone --config "$RCLONE_CONF" "$@"; }
+
+remote() { printf 'r2:%s/%s' "$BACKUP_BUCKET" "$BACKUP_PREFIX"; }
+
+wait_for_mysql() {
+  local i
+  for i in $(seq 1 "${1:-60}"); do
+    if q "SELECT 1" >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  return 1
+}

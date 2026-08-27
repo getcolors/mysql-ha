@@ -22,6 +22,14 @@ grep -qE '\(def \^:private mysql-ha-sha (nil|"[0-9a-f]{40}")\)' "$launcher" || f
 [ "$(grep -cE '\(def \^:private mysql-ha-sha ' "$launcher")" = 1 ] || fail 'more than one pin site'
 ok 'has one managed pin site'
 
+[[ -L "$root/green/green" && $(readlink "$root/green/green") == ../skills/package-mysql-ha-green/green ]] \
+  || fail 'green/green is not the payload symlink'
+[[ -L "$root/red/red" && $(readlink "$root/red/red") == ../skills/package-mysql-ha-red/red ]] \
+  || fail 'red/red is not the payload symlink'
+[[ -L "$root/blue/blue" && $(readlink "$root/blue/blue") == ../skills/package-mysql-ha-blue/blue ]] \
+  || fail 'blue/blue is not the payload symlink'
+ok 'each colour dir symlinks its skill payload'
+
 mkdir "$tmp/project"; cp "$launcher" "$tmp/project/green"; chmod +x "$tmp/project/green"
 cp "$root/test/fixtures/colors.yml" "$tmp/project/colors.yml"
 (cd "$tmp/project" && MYSQL_HA_LIB_ROOT="$root" ./green build >/dev/null) || fail 'working-tree override failed'

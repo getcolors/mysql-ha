@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — assert the live cluster from one member.
+#
+# Every check runs on the node, against the node's own server and the node's
+# own archive prefix, so `./green health` needs no database credential on the
+# operator's machine and no port open to it beyond SSH.
+#
+# Prints one line per check and exits non-zero if any of them failed.
+set -uo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+# shellcheck source=/dev/null
+. "$MYSQL_HA_ETC/secrets.env"
+
+failures=0
+
+pass() { printf '  PASS  %-24s %s\n' "$1" "${2:-}"; }
+bad()  { printf '  FAIL  %-24s %s\n' "$1" "${2:-}"; failures=$((failures + 1)); }
+check() { if [ "$1" = ok ]; then pass "$2" "$3"; else bad "$2" "$3"; fi; }
+
+age_seconds() {
+  local when now
+  when=$(date -u -d "$1" +%s 2>/dev/null) || { echo 999999999; return; }
+  now=$(date -u +%s)
+  echo $(( now - when ))
+}
+
+echo "mysql-ha health — ${NODE_NAME} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
+# --- membership --------------------------------------------------------------
+online=$(online_members)
+if [ "$online" = "3" ]; then
+  pass group-online "3 of 3 members ONLINE"
+else
+  bad group-online "only ${online} members ONLINE"
+fi
+
+primaries=$(q "SELECT COUNT(*) FROM performance_schema.replication_group_members
+               WHERE MEMBER_STATE='ONLINE' AND MEMBER_ROLE='PRIMARY'" 2>/dev/null || echo 0)
+check "$([ "$primaries" = 1 ] && echo ok || echo no)" group-primary \
+      "${primaries} primary in the group view"
+
+state=$(q "SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+           WHERE MEMBER_ID=@@server_uuid" 2>/dev/null || true)
+role=$(member_role)
+check "$([ "$state" = ONLINE ] && echo ok || echo no)" member-state \
+      "this member is ${state:-unknown} (${role:-secondary})"
+
+# --- replication is streaming ------------------------------------------------
+read -r applied proposed queued <<<"$(q "
+  SELECT COUNT_TRANSACTIONS_REMOTE_APPLIED,
+         COUNT_TRANSACTIONS_LOCAL_PROPOSED,
+         COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE
+    FROM performance_schema.replication_group_member_stats
+   WHERE MEMBER_ID=@@server_uuid
+     AND CHANNEL_NAME='group_replication_applier'" 2>/dev/null || echo "0 0 0")"
+
+if [ "$role" = PRIMARY ]; then
+  check "$([ "${proposed:-0}" -gt 0 ] && echo ok || echo no)" replication-streaming \
+        "proposed ${proposed:-0} transactions to the group"
+else
+  check "$([ "${applied:-0}" -gt 0 ] && echo ok || echo no)" replication-streaming \
+        "applied ${applied:-0} remote transactions, ${queued:-0} queued"
+fi
+
+# --- the heartbeat proves writes reach this member ---------------------------
+hb=$(q "SELECT TIMESTAMPDIFF(SECOND, ts, UTC_TIMESTAMP())
+          FROM mysql_ha.heartbeat WHERE id=1" 2>/dev/null || true)
+if [ -n "${hb:-}" ] && [ "$hb" -le 60 ] 2>/dev/null; then
+  pass heartbeat "${hb}s old on this member"
+else
+  bad heartbeat "heartbeat is ${hb:-absent}"
+fi
+
+# --- the client endpoint -----------------------------------------------------
+resolved=$(getent ahostsv4 "$CLUSTER_HOST" 2>/dev/null | awk 'NR==1{print $1}')
+check "$([ "$resolved" = "$RESERVED_IP" ] && echo ok || echo no)" endpoint-dns \
+      "${CLUSTER_HOST} resolves to ${resolved:-nothing} (reserved ${RESERVED_IP})"
+
+if [ "$role" = PRIMARY ]; then
+  holder=$(curl -sS --fail-with-body --max-time 20 \
+             -H "Authorization: Bearer ${DO_TOKEN}" \
+             "https://api.digitalocean.com/v2/reserved_ips/${RESERVED_IP}" \
+           | jq -r '.reserved_ip.droplet.id // empty')
+  check "$([ "$holder" = "$DROPLET_ID" ] && echo ok || echo no)" endpoint-assignment \
+        "reserved IP held by droplet ${holder:-none}, primary is ${DROPLET_ID}"
+fi
+
+# --- a snapshot landed in the backup bucket ----------------------------------
+if snapshot=$(rc cat "$(remote)/snapshot/latest.json" 2>/dev/null); then
+  snap_age=$(age_seconds "$(jq -r '.created_at' <<<"$snapshot")")
+  snap_ts=$(jq -r '.snapshot' <<<"$snapshot")
+  if rc lsjson "$(remote)/snapshot/${snap_ts}/dump.sql.zst" >/dev/null 2>&1; then
+    check "$([ "$snap_age" -lt 93600 ] && echo ok || echo no)" snapshot \
+          "${snap_ts} is $(( snap_age / 3600 ))h old"
+  else
+    bad snapshot "${snap_ts} is published but its dump object is missing"
+  fi
+else
+  bad snapshot "no snapshot/latest.json in the backup bucket"
+fi
+
+# --- point-in-time material is still arriving --------------------------------
+recent=$(rc lsjson --max-age 10m "$(remote)/binlog/${NODE_NAME}/" 2>/dev/null \
+         | jq 'length' 2>/dev/null || echo 0)
+check "$([ "${recent:-0}" -gt 0 ] && echo ok || echo no)" binlog-archive \
+      "${recent:-0} binary-log objects touched in the last 10 minutes"
+
+archived=$(rc lsjson "$(remote)/binlog/${NODE_NAME}/" 2>/dev/null \
+           | jq 'length' 2>/dev/null || echo 0)
+check "$([ "${archived:-0}" -gt 0 ] && echo ok || echo no)" binlog-archive-total \
+      "${archived:-0} binary logs archived for this member"
+
+# --- the verified restore --------------------------------------------------
+if restore=$(rc cat "$(remote)/restore-check/latest.json" 2>/dev/null); then
+  st=$(jq -r '.status' <<<"$restore")
+  rc_age=$(age_seconds "$(jq -r '.finished_at' <<<"$restore")")
+  detail=$(jq -r '.detail' <<<"$restore")
+  if [ "$st" = ok ] && [ "$rc_age" -lt 93600 ]; then
+    pass restore-verified "$(( rc_age / 3600 ))h ago: ${detail}"
+  else
+    bad restore-verified "status ${st}, $(( rc_age / 3600 ))h ago: ${detail}"
+  fi
+else
+  bad restore-verified "no restore-check/latest.json in the backup bucket"
+fi
+
+echo "  ${failures} failed check(s) on ${NODE_NAME}"
+exit $(( failures > 0 ? 1 : 0 ))

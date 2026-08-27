@@ -1,0 +1,15 @@
+declare module "*.tf" { const content: string; export default content; }
+declare module "*.yml" { const content: string; export default content; }
+declare module "*.yaml" { const content: string; export default content; }
+declare module "*.cfg" { const content: string; export default content; }
+declare module "*.cnf" { const content: string; export default content; }
+declare module "*.env" { const content: string; export default content; }
+declare module "*/apparmor-local" { const content: string; export default content; }
+declare module "*/mysql-ha-binlog-archive" { const content: string; export default content; }
+declare module "*/mysql-ha-binlog-upload" { const content: string; export default content; }
+declare module "*/mysql-ha-endpoint" { const content: string; export default content; }
+declare module "*/mysql-ha-health" { const content: string; export default content; }
+declare module "*/mysql-ha-heartbeat" { const content: string; export default content; }
+declare module "*/mysql-ha-lib" { const content: string; export default content; }
+declare module "*/mysql-ha-restore-check" { const content: string; export default content; }
+declare module "*/mysql-ha-snapshot" { const content: string; export default content; }

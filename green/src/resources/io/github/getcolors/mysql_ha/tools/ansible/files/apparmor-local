@@ -1,0 +1,11 @@
+# Managed by Colors mysql-ha — /etc/apparmor.d/local/usr.sbin.mysqld
+#
+# Ubuntu confines mysqld to /var/lib/mysql and /var/log/mysql. The verified
+# restore starts a second mysqld on a scratch datadir, which the shipped
+# profile denies. The profile is extended rather than disabled: everything
+# below is the scratch tree and the read-only agent configuration, and nothing
+# else.
+  /etc/mysql-ha/ r,
+  /etc/mysql-ha/** r,
+  /var/lib/mysql-ha/ rw,
+  /var/lib/mysql-ha/** rwk,

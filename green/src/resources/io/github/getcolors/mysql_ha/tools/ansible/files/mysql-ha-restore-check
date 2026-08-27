@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — prove the backup can actually be restored.
+#
+# A backup nobody restores is a rumour. This builds a real server from the
+# published snapshot and the published binary logs, then asks it three
+# questions that a merely-well-formed dump could not answer:
+#
+#   1. does its gtid_executed cover the snapshot's gtid_executed?
+#   2. did replaying the archived binary logs add heartbeat rows the snapshot
+#      did not already have?   <- the only assertion that tests PITR material
+#   3. is the newest heartbeat in the restored copy fresher than
+#      backup-restore-max-lag-seconds?
+#
+# The verdict is published to R2 whether it passes or fails, so a silent
+# failure of this job is itself detectable: `latest.json` stops being fresh.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+
+owns_backup_role || { log "not the backup owner for this cycle"; exit 0; }
+
+started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sock="$VERIFY_DIR/mysqld.sock"
+snap_ts=""
+lag=null
+beats=null
+
+stop_instance() {
+  if [ -f "$VERIFY_DIR/mysqld.pid" ]; then
+    mysqladmin --socket="$sock" --user=root shutdown >/dev/null 2>&1 || \
+      kill "$(cat "$VERIFY_DIR/mysqld.pid" 2>/dev/null)" 2>/dev/null || true
+    for _ in $(seq 1 60); do [ -S "$sock" ] || break; sleep 1; done
+  fi
+}
+
+verdict() {
+  local status=$1 detail=$2 stamp
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  mkdir -p "$MYSQL_HA_STATE/tmp"
+  cat > "$MYSQL_HA_STATE/tmp/restore-check.json" <<EOF
+{
+  "status": "${status}",
+  "node": "${NODE_NAME}",
+  "snapshot": "${snap_ts}",
+  "started_at": "${started}",
+  "finished_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "heartbeat_lag_seconds": ${lag},
+  "replayed_beats": ${beats},
+  "detail": "${detail}"
+}
+EOF
+  rc copyto "$MYSQL_HA_STATE/tmp/restore-check.json" \
+     "$(remote)/restore-check/${stamp}.json" || true
+  rc copyto "$MYSQL_HA_STATE/tmp/restore-check.json" \
+     "$(remote)/restore-check/latest.json" || true
+}
+
+fail() {
+  stop_instance
+  verdict failed "$1"
+  log "FAILED: $1"
+  exit 1
+}
+
+trap 'stop_instance; rm -rf "$VERIFY_DIR/data" "$VERIFY_DIR/tmp" "$VERIFY_DIR/download"' EXIT
+
+rm -rf "$VERIFY_DIR"
+mkdir -p "$VERIFY_DIR/data" "$VERIFY_DIR/tmp" "$VERIFY_DIR/download/binlog"
+chown -R mysql:mysql "$VERIFY_DIR"
+chmod 0750 "$VERIFY_DIR"
+
+# --- 1. fetch and verify the published snapshot -----------------------------
+rc copyto "$(remote)/snapshot/latest.json" "$VERIFY_DIR/download/latest.json" \
+  || fail "no snapshot pointer in R2"
+
+snap_ts=$(jq -r '.snapshot' "$VERIFY_DIR/download/latest.json")
+want_sha=$(jq -r '.sha256' "$VERIFY_DIR/download/latest.json")
+snap_gtid=$(jq -r '.gtid_executed' "$VERIFY_DIR/download/latest.json")
+
+rc copyto "$(remote)/snapshot/${snap_ts}/dump.sql.zst" \
+   "$VERIFY_DIR/download/dump.sql.zst" \
+  || fail "snapshot ${snap_ts} has no dump object"
+
+have_sha=$(sha256sum "$VERIFY_DIR/download/dump.sql.zst" | cut -d' ' -f1)
+[ "$have_sha" = "$want_sha" ] || fail "snapshot ${snap_ts} checksum mismatch"
+
+# --- 2. fetch the point-in-time material ------------------------------------
+# 48h comfortably spans a daily snapshot plus a missed cycle. Older archived
+# logs cannot contribute anything the dump does not already contain.
+rc copy "$(remote)/binlog/${NODE_NAME}/" "$VERIFY_DIR/download/binlog/" \
+   --max-age 48h --include 'binlog.*' \
+  || fail "archived binary logs for ${NODE_NAME} could not be fetched"
+
+mapfile -t logs < <(find "$VERIFY_DIR/download/binlog" -maxdepth 1 -type f \
+                      -name 'binlog.[0-9]*' | sort)
+[ "${#logs[@]}" -gt 0 ] || fail "no archived binary logs within the recovery window"
+
+chown -R mysql:mysql "$VERIFY_DIR"
+
+# --- 3. build a scratch server ----------------------------------------------
+mysqld --defaults-file="$MYSQL_HA_ETC/verify.cnf" --initialize-insecure \
+  >/dev/null 2>&1 || fail "verification instance would not initialize"
+
+mysqld --defaults-file="$MYSQL_HA_ETC/verify.cnf" --daemonize \
+  || fail "verification instance would not start"
+
+for _ in $(seq 1 90); do [ -S "$sock" ] && break; sleep 1; done
+[ -S "$sock" ] || fail "verification instance never opened its socket"
+
+vq() { mysql --socket="$sock" --user=root -N -B -e "$1"; }
+
+# --- 4. restore -------------------------------------------------------------
+# The dump carries SET @@GLOBAL.GTID_PURGED, so the restored server knows
+# exactly which transactions it already has.
+zstd -dc "$VERIFY_DIR/download/dump.sql.zst" \
+  | mysql --socket="$sock" --user=root \
+  || fail "snapshot ${snap_ts} would not load"
+
+before=$(vq "SELECT COUNT(*) FROM mysql_ha.beat_log") \
+  || fail "restored copy has no mysql_ha.beat_log"
+
+# --- 5. replay ---------------------------------------------------------------
+# Transactions the dump already contained are skipped by GTID, so the replay is
+# idempotent and needs no position arithmetic at all.
+mysqlbinlog "${logs[@]}" | mysql --socket="$sock" --user=root \
+  || fail "archived binary logs would not replay"
+
+after=$(vq "SELECT COUNT(*) FROM mysql_ha.beat_log")
+beats=$(( after - before ))
+
+# --- 6. assert ---------------------------------------------------------------
+covered=$(vq "SELECT GTID_SUBSET('${snap_gtid}', @@GLOBAL.gtid_executed)")
+[ "$covered" = "1" ] \
+  || fail "restored gtid_executed does not cover the snapshot's"
+
+[ "$beats" -gt 0 ] \
+  || fail "replaying the archive added no heartbeat rows; the point-in-time material is not advancing"
+
+lag=$(vq "SELECT TIMESTAMPDIFF(SECOND, ts, UTC_TIMESTAMP()) FROM mysql_ha.heartbeat WHERE id = 1")
+[ -n "$lag" ] || fail "restored copy has no heartbeat row"
+[ "$lag" -le "$BACKUP_RESTORE_MAX_LAG_SECONDS" ] \
+  || fail "restored copy is ${lag}s behind, over the ${BACKUP_RESTORE_MAX_LAG_SECONDS}s budget"
+
+stop_instance
+verdict ok "restored ${snap_ts} and replayed ${#logs[@]} archived logs"
+log "OK: snapshot ${snap_ts}, ${beats} replayed heartbeats, ${lag}s behind"

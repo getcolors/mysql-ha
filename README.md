@@ -224,16 +224,23 @@ printf '%s' "$COLORS_PAR_MYSQL_REPLICATION_PASSWORD" | sha256sum | cut -c1-32
 
 ## Development
 
+The package is tri-colour: the canonical Clojure implementation lives in
+`green/`, with byte-identical TypeScript/Bun and Python/uv implementations in
+`red/` and `blue/`.
+
 ```sh
-bb test                 # unit suite
-bb golden               # render the fixture and diff it against the record
-./scripts/launcher.sh   # what the unit suite cannot reach: the copied payload
+cd green && bb test      # unit suite (canonical Clojure implementation)
+cd green && bb golden    # render the fixture and diff it against the record
+cd red && bun test && bun run typecheck   # TypeScript implementation
+cd blue && uv run pytest                  # Python implementation
+./scripts/parity.sh      # all three colours render byte-identical trees
+./scripts/launcher.sh    # what the unit suite cannot reach: the copied payload
 ```
 
-`GREEN_LIB_ROOT` and `MYSQL_HA_LIB_ROOT` point the launcher at working trees
+`GREEN_LIB_ROOT` and `MYSQL_HA_LIB_ROOT` point the launchers at working trees
 instead of pins. A change spanning two repositories is two commits in two
-repositories, upstream pushed first; `bb pin` stamps the launcher only from a
-clean, pushed HEAD.
+repositories, upstream pushed first; `bb pin` (in `green/`) stamps all three
+launchers only from a clean, pushed HEAD.
 
 ## License
 

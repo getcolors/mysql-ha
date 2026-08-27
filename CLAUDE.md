@@ -2,31 +2,65 @@
 
 ## What this is
 
-`mysql-ha` is a green-only Package Skill for a three-member MySQL **Group
-Replication** cluster on DigitalOcean, with daily snapshots and continuous
-binary-log archiving to Cloudflare R2 and a scheduled verified restore. The
-consumer is `../mysql-ha-digitalocean`.
+`mysql-ha` is a tri-colour Package Skill (green, red, blue) for a three-member
+MySQL **Group Replication** cluster on DigitalOcean, with daily snapshots and
+continuous binary-log archiving to Cloudflare R2 and a scheduled verified
+restore. The consumer is `../mysql-ha-digitalocean`.
 
 Read `plans/0001-mysql-ha-v1.md` for why each component was chosen; the code
 and the tests are authoritative for what it does. `BENCHMARK.md` is the log of
 the run that built it and is not maintained afterwards.
 
-## Commands
+## Layout and commands
+
+The three implementations live in the tri-colour layout, matching `netbird`
+and `clickhouse`: canonical Clojure in `green/` (`green/bb.edn`,
+`green/deps.edn`, `green/src/`, `green/tasks/`, tests under `green/test/clj`),
+TypeScript/Bun in `red/`, and Python/uv in `blue/`. Green is canonical: a
+behavioural change lands in all three colours in the same commit and passes
+`scripts/parity.sh`. The fixture and the goldens are shared across colours at
+the repository root — `test/fixtures/` and `test/resources/golden/` — with
+`green/test/fixtures` and `green/test/resources` symlinks pointing at them.
+Each colour dir holds a launcher symlink to its skill payload (`green/green`,
+`red/red`, `blue/blue`).
 
 ```sh
-bb test
-bb golden
-bb golden:accept       # only after reading the diff
-./scripts/launcher.sh
-./green build
-./green create --dry-run
-./green health         # read-only assertions against the live cluster
+cd green && bb test
+cd green && bb golden
+cd green && bb golden:accept   # only after reading the diff
+cd red && bun test && bun run typecheck
+cd blue && uv run pytest
+./scripts/parity.sh            # three colours, two state backends, byte for byte
+./scripts/launcher.sh          # from the repository root
+cd green && ./green build
+cd green && ./green create --dry-run
+cd green && ./green health     # read-only assertions against the live cluster
 ```
+
+The goldens have a second axis beside the fixture: the one
+`test/fixtures/colors.yml` is rendered under the **local** state backend and
+again under **r2** (`COLORS_PAR_PROVIDER_BACKEND=r2` overlaid on the same
+file). The committed trees live at
+`test/resources/golden/{local,r2}/mysql-ha-fixture/` and differ only in each
+OpenTofu stage's `backend.tf.json`. `scripts/golden.sh` checks green against
+both; `scripts/parity.sh` renders both variants through every colour and
+diffs the trees — and the colour template trees (`red/resources`, blue's
+embedded `resources/`) — byte for byte.
 
 Never run a real `create`/`delete` without explicit authorization. Never edit or
 read `.colors/`, and never read `.envrc.private`. Real deletion requires
 `COLORS_PAR_COMPUTE_PREVENT_DESTROY=false` for one run; never edit the
 committed flag.
+
+## Coupling
+
+The package depends only on the SDK — no ONCE anywhere: it pins Green in
+`green/deps.edn`, the Red SDK in `red/package.json`, and the Blue SDK in
+`blue/pyproject.toml`. Use `MYSQL_HA_LIB_ROOT` (the repository root, for every
+colour; red also accepts the `red/` dir directly) and `GREEN_LIB_ROOT` for
+working-tree development. Final launchers use a pushed SHA managed by `bb pin`
+(run in `green/`), which stamps all three payloads from their unpinned birth
+forms; deployment launchers are copies, not symlinks.
 
 ## Architecture
 
@@ -40,8 +74,9 @@ health  start ─ load-infrastructure ─ health
 `dns` and `base` fork and join at `cluster`. Stage names are remote-state keys
 (`<profile>/mysql-ha-infrastructure.tfstate`) and must not move.
 
-The package depends only on Green. Its own multi-node DigitalOcean template is
-preferable to coupling to ONCE's single-server one, the way `k8s` decided.
+The package depends only on the SDK (Green, and its Red/Blue ports per
+colour). Its own multi-node DigitalOcean template is preferable to coupling to
+ONCE's single-server one, the way `k8s` decided.
 
 Four things are load-bearing and easy to break:
 
@@ -96,6 +131,6 @@ paths already encode the repository. Never add one tag without the other.
 
 ## Git
 
-Work on the current branch. The launcher pin is managed only by `bb pin` after a
-clean pushed commit; never invent or hand-edit `mysql-ha-sha`. Do not commit or
-push unless explicitly asked.
+Work on the current branch. The launcher pins are managed only by `bb pin` (in
+`green/`) after a clean pushed commit; never invent or hand-edit `mysql-ha-sha`
+or its red/blue counterparts. Do not commit or push unless explicitly asked.

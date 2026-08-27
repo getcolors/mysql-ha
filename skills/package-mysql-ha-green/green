@@ -12,12 +12,12 @@
 ;; so overriding it from the environment can only point mysql-ha at another
 ;; project's state.
 ;;
-;; This file is both the skill payload and the repository entry point — ./green
-;; in the project root is a symlink to it. It deliberately holds no logic of its
-;; own: validation, the graph and the steps all live in the `mysql-ha` library,
-;; where the test suite reaches them. A copied payload is the one place in this
-;; project where code cannot be tested, so nothing that can live elsewhere
-;; should live here. scripts/launcher.sh covers what remains.
+;; This file is both the skill payload and the repository entry point —
+;; green/green in the repository is a symlink to it. It deliberately holds no
+;; logic of its own: validation, the graph and the steps all live in the
+;; `mysql-ha` library, where the test suite reaches them. A copied payload is
+;; the one place in this project where code cannot be tested, so nothing that
+;; can live elsewhere should live here. scripts/launcher.sh covers what remains.
 
 (require '[babashka.fs :as fs]
          '[clojure.java.io :as io]
@@ -51,24 +51,26 @@
 ;; cannot resolve its own library says so rather than inventing a SHA or
 ;; silently falling back to whatever is lying around. `bb pin` refuses to stamp
 ;; a dirty or unpushed HEAD for the same reason.
-(def ^:private mysql-ha-sha "1a6ff963ba32c0578253d64c21dcda9597270405")
+(def ^:private mysql-ha-sha nil)
 
 (def ^:private mysql-ha-git-url "https://github.com/getcolors/mysql-ha.git")
 (def ^:private green-git-url "https://github.com/getcolors/green.git")
 
 (defn- lib-coord
-  [env-var url sha]
+  [env-var url sha deps-root]
   (if-let [root (System/getenv env-var)]
-    {:local/root root}
-    (when sha {:git/url url :git/sha sha})))
+    {:local/root (if deps-root (str (io/file root deps-root)) root)}
+    (when sha
+      (cond-> {:git/url url :git/sha sha}
+        deps-root (assoc :deps/root deps-root)))))
 
 (def ^:private resolved?
   (some? (io/resource "io/github/getcolors/mysql_ha/tools.clj")))
 
 (def ^:private bootstrap-error
   (when (and (System/getProperty "babashka.version") (not resolved?))
-    (let [mysql-ha (lib-coord "MYSQL_HA_LIB_ROOT" mysql-ha-git-url mysql-ha-sha)
-          green (lib-coord "GREEN_LIB_ROOT" green-git-url nil)]
+    (let [mysql-ha (lib-coord "MYSQL_HA_LIB_ROOT" mysql-ha-git-url mysql-ha-sha "green")
+          green (lib-coord "GREEN_LIB_ROOT" green-git-url nil nil)]
       (if-not mysql-ha
         (str "this launcher carries no mysql-ha pin.\n"
              "It has not been stamped by `bb pin`, which cannot run until the "

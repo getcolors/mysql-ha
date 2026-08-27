@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Managed by Colors mysql-ha — move the binary-log spool to R2.
+#
+# Runs every <{ backup-binlog-upload-interval }>. The file the archiver is
+# currently writing is uploaded too, and replaced by a longer version on the
+# next tick: that is what bounds the recovery window by this timer rather than
+# by how often MySQL happens to rotate a log.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. /usr/local/lib/mysql-ha-lib
+
+[ -d "$BINLOG_SPOOL" ] || exit 0
+
+rc copy "$BINLOG_SPOOL" "$(remote)/binlog/${NODE_NAME}/" --include 'binlog.*'
+
+# Local spool retention only. Nothing is removed from R2 here — that is the
+# daily snapshot job's business, and a copy loop that could delete the archive
+# is a copy loop that will.
+find "$BINLOG_SPOOL" -maxdepth 1 -type f -name 'binlog.[0-9]*' \
+  -mtime "+${BACKUP_RETENTION_DAYS}" -delete
