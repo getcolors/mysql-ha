@@ -62,4 +62,16 @@ if grep -q '(def ^:private mysql-ha-sha nil)' "$launcher"; then
   ok 'unpinned launcher explains itself'
 fi
 
+# The ONCE pin is one fact in four places: the three manifests and the red
+# payload's PINS, which installs ONCE itself (blue resolves it transitively
+# through the package). A manifest bump the red payload did not follow
+# installs a package whose `computeCluster` import fails at first use in a
+# deployment, not here.
+once_sha=$(awk '/once\.git/ {found=1} found && match($0, /:git\/sha "[0-9a-f]{40}"/) {print substr($0, RSTART+10, 40); exit}' "$root/green/deps.edn")
+[ -n "$once_sha" ] || fail 'green/deps.edn carries no ONCE pin'
+grep -q "getcolors/once#$once_sha" "$root/red/package.json" || fail 'red/package.json ONCE pin differs from green'
+grep -q "rev = \"$once_sha\"" "$root/blue/pyproject.toml" || fail 'blue/pyproject.toml ONCE pin differs from green'
+grep -q "getcolors/once#$once_sha" "$root/skills/package-mysql-ha-red/red" || fail 'red payload PINS ONCE pin differs from green'
+ok 'the ONCE pin agrees in green, red, blue, and the red payload'
+
 echo "launcher: $checks checks passed"
