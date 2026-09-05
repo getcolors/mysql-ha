@@ -6,21 +6,26 @@ to each other, so `dns` and `base` run in parallel and join at `cluster`.
 Joining DNS there rather than leaving it dangling means a bad zone or a
 missing token surfaces before any data-plane work starts.
 
-Delete and health both begin by reading node addresses out of remote state,
-because neither can re-derive them.
+Delete and health both begin by adopting the cluster out of remote state,
+because neither can re-derive it. The state is read once, in preflight, so
+the Compute Provider Standard's switch guard runs before the credentials are
+checked; the read is handed to `load-infrastructure` rather than repeated.
 """
 
 from __future__ import annotations
 
-from blue import dry_run, progress, tofu
+import os
+
+from blue import dry_run, progress
 from blue.cli import par_name, read_pars
 from blue.lifecycle import preflight
 from blue.workflow import advice_add, workflow
+from package_once_blue import compute_cluster as cluster
 
 from . import tools, validate
 
 DEFAULTS = {"compute-prevent-destroy": True,
-            "provider-compute": "digitalocean",
+            "provider-compute": validate.default_compute_provider,
             "provider-dns": "cloudflare",
             "provider-backend": "local",
             "workdir": ".colors"}
@@ -30,19 +35,51 @@ DEFAULTS = {"compute-prevent-destroy": True,
 CREDENTIAL_EVENTS = ("create", "delete", "health")
 
 
-async def start_step(opts: dict, env: dict | None = None) -> dict:
+def _real_credential_event(context: dict) -> bool:
+    return bool(context.get("real") and context.get("event") in CREDENTIAL_EVENTS)
+
+
+async def start_step(original: dict, env: dict | None = None, reader=None) -> dict:
+    """Preflight. On a real create, delete or health the compute state is
+    read once through `reader` — the package's `tools.state_output` unless a
+    test injects another — on the same defaulted and overlaid opts the
+    validators see, and only once desired state itself has passed, so the
+    reader never renders an invalid colors.yml. The read feeds the switch
+    guard here and travels on under `mysql-ha/state` for
+    `load-infrastructure` to adopt."""
+    reader = reader if reader is not None else tools.state_output
+    environment = dict(os.environ if env is None else env)
+    overlaid = read_pars({**DEFAULTS, **original}, environment)
+    context = {"event": overlaid.get("blue/event"), "real": not overlaid.get("blue/dry-run")}
+    state: dict = {}
+    if (_real_credential_event(context)
+            and not validate.env_errors(environment)
+            and not validate.state_errors(overlaid)):
+        state = await cluster.read_state(overlaid, reader)
+
+    def after(opts, _env, ctx):
+        result = {**opts, "blue/exit": 0}
+        if _real_credential_event(ctx):
+            result["mysql-ha/state"] = state
+        return result
+
     return await preflight(
-        opts, defaults=DEFAULTS, overlay=read_pars, env=env,
+        original, defaults=DEFAULTS, overlay=read_pars, env=environment,
         validators=[
             lambda _o, e, _c: validate.env_errors(e),
             lambda o, _e, _c: validate.state_errors(o),
-            lambda o, _e, c: (validate.secret_errors(o)
-                              if c["real"] and c["event"] in CREDENTIAL_EVENTS else []),
+            # Standard §4 before the credentials: a recorded provider that
+            # differs from the selected one reports the actionable error, not
+            # a missing token for the provider that was just selected.
+            lambda o, _e, c: (cluster.provider_validator(
+                validate.spec, o, state.get("params"), lambda: validate.secret_errors(o))
+                if _real_credential_event(c) else []),
             lambda o, _e, c: ([f"compute destruction is protected; set "
                                f"{par_name('compute-prevent-destroy')}=false to delete"]
                               if c["real"] and c["event"] == "delete"
                               and o.get("compute-prevent-destroy") else []),
-        ])
+        ],
+        after_validate=after)
 
 
 def wire_fn(step: str, run_opts: dict):
@@ -75,9 +112,10 @@ def wire_fn(step: str, run_opts: dict):
 
 
 def backend_advice(tool: str):
-    return tofu.conventional_backend_advice(
-        dir=lambda o, tool=tool: tools.tool_dir(o, tool),
-        key=lambda o, tool=tool: f"{o.get('profile')}/{tool}.tfstate")
+    """The state backend of one OpenTofu stage: `tools.backend_advice`, which
+    the state reader also runs, so a delete from a fresh clone finds its
+    state."""
+    return tools.backend_advice(tool)
 
 
 side_effecting = ["mysql-ha/infrastructure", "mysql-ha/load-infrastructure",

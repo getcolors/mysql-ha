@@ -1,6 +1,7 @@
 (ns io.github.getcolors.mysql-ha.validate-test
   (:require [clojure.test :refer [deftest is testing]]
             [green.cli :as green-cli]
+            [io.github.getcolors.once.compute-cluster :as cluster]
             [io.github.getcolors.mysql-ha.validate :as validate]))
 
 (def fixture
@@ -10,7 +11,8 @@
   (is (= [] (validate/state-errors fixture))))
 
 (deftest every-required-key-is-required
-  (doseq [k validate/own-required]
+  (doseq [k (concat validate/own-required
+                    (get-in validate/compute-providers ["digitalocean" :required]))]
     (testing (str k)
       (is (some #(re-find (re-pattern (str k " is required")) %)
                 (validate/state-errors (dissoc fixture k)))))))
@@ -20,12 +22,32 @@
   (is (nil? (validate/env-errors {"COLORS_PAR_PROFILE" ""})))
   (is (seq (validate/env-errors {"COLORS_PAR_PROFILE" "somewhere-else"}))))
 
+(deftest the-spec-describes-one-homogeneous-role-on-a-discovered-network
+  ;; The Compute Cluster Standard's spec is data ONCE reads; this is the one
+  ;; place its content is asserted, so a drift in any colour is a test
+  ;; failure and not a rendered surprise.
+  (is (= [] (cluster/spec-errors validate/spec)))
+  (is (= ["digitalocean"] (keys (:registry validate/spec))))
+  (is (= "digitalocean" (:default validate/spec)))
+  (is (= {:mode :discovered} (get-in validate/spec [:registry "digitalocean" :network])))
+  (is (= ["ssh-sources" "client-sources"] (get-in validate/spec [:sources :non-empty])))
+  (is (= [{:role nil :count-key :cluster-nodes :count 3 :fallback-offset 11}]
+         (:roles validate/spec)))
+  (is (= "10.110.0.0/20" (:fallback-subnet validate/spec)))
+  (is (= [] (cluster/topology-errors validate/spec fixture))))
+
 (deftest the-node-budget-is-three
   (is (seq (validate/state-errors (assoc fixture :cluster-nodes 2))))
-  (is (seq (validate/state-errors (assoc fixture :cluster-nodes 5)))))
+  (is (seq (validate/state-errors (assoc fixture :cluster-nodes 5))))
+  (testing "a count that is not a positive integer is ONCE's to refuse too"
+    (is (some #{":cluster-nodes must be a positive integer"}
+              (validate/state-errors (assoc fixture :cluster-nodes "3"))))))
 
 (deftest the-vpc-is-never-desired-state
-  (is (seq (validate/state-errors (assoc fixture :digitalocean-vpc-mode "managed")))))
+  (is (seq (validate/state-errors (assoc fixture :digitalocean-vpc-mode "managed"))))
+  (testing "a pinned VPC is refused by the standard's discovered-network rule"
+    (is (seq (validate/state-errors (assoc fixture :digitalocean-vpc-uuid "00000000-0000-0000-0000-000000000000"))))
+    (is (seq (validate/state-errors (assoc fixture :digitalocean-vpc-cidr "10.110.0.0/20"))))))
 
 (deftest the-group-name-must-be-a-uuid
   (is (seq (validate/state-errors (assoc fixture :mysql-group-name "mysql-ha"))))
@@ -48,11 +70,16 @@
             (assoc fixture :backup-r2-bucket (:r2-bucket fixture))))))
 
 (deftest source-lists-must-be-cidrs
-  (is (seq (validate/state-errors (assoc fixture :digitalocean-ssh-sources []))))
-  (is (seq (validate/state-errors
-            (assoc fixture :digitalocean-client-sources ["203.0.113.7"]))))
-  (is (seq (validate/state-errors
-            (assoc fixture :digitalocean-ssh-sources "203.0.113.7/32")))))
+  ;; The messages are ONCE's: the source lists are the Compute Provider
+  ;; Standard's, checked over `spec`.
+  (is (some #{":digitalocean-ssh-sources must list at least one CIDR"}
+            (validate/state-errors (assoc fixture :digitalocean-ssh-sources []))))
+  (is (some #{":digitalocean-client-sources entry \"203.0.113.7\" is not an IPv4 or IPv6 CIDR"}
+            (validate/state-errors
+             (assoc fixture :digitalocean-client-sources ["203.0.113.7"]))))
+  (testing "a string is a list, the way an overlay carries one"
+    (is (= [] (validate/state-errors
+               (assoc fixture :digitalocean-ssh-sources "203.0.113.7/32, 198.51.100.0/24"))))))
 
 (deftest schedules-and-durations-are-checked
   (is (seq (validate/state-errors (assoc fixture :heartbeat-interval "often"))))
@@ -91,6 +118,7 @@
                              :cloudflare-api-token "f"})))))
 
 (deftest only-the-providers-this-package-implements-are-accepted
-  (is (seq (validate/state-errors (assoc fixture :provider-compute "hcloud"))))
+  (is (some #{":provider-compute must be one of digitalocean"}
+            (validate/state-errors (assoc fixture :provider-compute "hcloud"))))
   (is (seq (validate/state-errors (assoc fixture :provider-dns "yandex"))))
   (is (= [] (validate/state-errors (assoc fixture :provider-backend "local")))))

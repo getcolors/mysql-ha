@@ -49,9 +49,12 @@ if grep -q 'resource "digitalocean_vpc"' "$infra"; then
 fi
 # Three members and no more.
 grep -qE 'count *= *3' "$infra"
-# The reserved IP must never carry an assignment in desired state.
+# The reserved IP must never carry an assignment in desired state. The check
+# is scoped to the resource block: the `params` output reports each droplet's
+# id, which is a fact about the members, not an assignment of the endpoint.
 grep -q 'resource "digitalocean_reserved_ip" "endpoint"' "$infra"
-if grep -qE '^\s*droplet_id\s*=' "$infra"; then
+if sed -n '/^resource "digitalocean_reserved_ip" "endpoint" {/,/^}/p' "$infra" \
+     | grep -qE '^\s*droplet_id\s*='; then
   echo 'the reserved IP assignment must not be desired state' >&2; exit 1
 fi
 # Every destroyable resource is guarded.

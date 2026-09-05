@@ -125,3 +125,25 @@ output "vpc_id" {
 output "vpc_ip_range" {
   value = data.digitalocean_vpc.cluster.ip_range
 }
+
+# The Compute Cluster Standard's `params`: the one output every later stage
+# reads. The outputs above stay so no state output disappears; after adoption
+# nothing reads them but the legacy translation.
+output "params" {
+  value = {
+    provider     = "digitalocean"
+    reserved_ip  = digitalocean_reserved_ip.endpoint.ip_address
+    vpc_id       = data.digitalocean_vpc.cluster.id
+    vpc_ip_range = data.digitalocean_vpc.cluster.ip_range
+    nodes = [for i, d in digitalocean_droplet.node : {
+      index      = i
+      role       = null
+      name       = d.name
+      ip         = d.ipv4_address
+      vpc_ip     = d.ipv4_address_private
+      droplet_id = d.id
+      user       = "root"
+      sudoer     = "root"
+    }]
+  }
+}

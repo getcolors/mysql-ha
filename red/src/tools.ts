@@ -6,6 +6,12 @@
 // One Ansible directory holds every playbook, because they share an inventory
 // and a set of rendered scripts and splitting them across directories would
 // duplicate both.
+//
+// The cluster itself — which machines exist, at which addresses — is the
+// Compute Cluster Standard's `params`, adopted through ONCE's `computeCluster`
+// module and carried under `once/cluster`. This package puts its own facts
+// inside it: `reserved_ip`, `vpc_id` and `vpc_ip_range` at the top level, a
+// `droplet_id` on every node.
 
 import * as ansible from "red/ansible";
 import { toolEnv } from "red/providers";
@@ -14,6 +20,7 @@ import * as tofu from "red/tofu";
 import { runtime } from "red/runtime";
 import type { Opts } from "red/workflow";
 import { StepError, failed } from "red/workflow";
+import { compute, computeCluster } from "package-once-red";
 import * as utils from "./utils.ts";
 import * as validate from "./validate.ts";
 
@@ -91,21 +98,37 @@ export function credentialEnv(opts: Opts, ...slots: string[]): Record<string, st
   return toolEnv(validate.providers, opts, [...slots, "provider-backend"]);
 }
 
+// The state backend of one OpenTofu stage, written before the stage runs.
+// `dir` and `key` are explicit so the state addresses cannot move.
+export function backendAdvice(tool: string) {
+  return tofu.conventionalBackendAdvice({
+    dir: (opts) => toolDir(opts, tool),
+    key: (opts) => `${opts.profile}/${tool}.tfstate`,
+  });
+}
+
+function refuse(opts: Opts, errors: string[]): Opts {
+  return { ...opts, "red/exit": 1, "red/err": errors.join("\n") };
+}
+
 // ---------------------------------------------------------------------------
 // infrastructure
 
-// Stand-ins so `build` and `--dry-run` render the same shape of file as a real
-// run, without ever reading state or contacting a provider. Documentation-range
-// addresses, so a rendered artifact that leaked into a real run would fail
-// loudly rather than reach something.
+// Stand-ins for the cluster facts beside the nodes, so `build` and `--dry-run`
+// render the same shape of file as a real run without ever reading state or
+// contacting a provider. Documentation-range values, so a rendered artifact
+// that leaked into a real run would fail loudly rather than reach something.
+// The nodes themselves are ONCE's fallbacks, cut from `spec`'s subnet at
+// offset 11.
 export const fallbackOutputs: Opts = {
-  node_public_ips: ["192.0.2.11", "192.0.2.12", "192.0.2.13"],
-  node_private_ips: ["10.110.0.11", "10.110.0.12", "10.110.0.13"],
-  node_droplet_ids: [100000001, 100000002, 100000003],
   reserved_ip: "192.0.2.10",
   vpc_id: "00000000-0000-0000-0000-000000000000",
   vpc_ip_range: "10.110.0.0/20",
 };
+
+// The droplet id a build renders for member `ordinal`; a real run reads every
+// id from state.
+const fallbackDropletId = (ordinal: number): number => 100000000 + ordinal;
 
 export function infrastructureSpecs(opts: Opts): Spec[] {
   const dir = toolDir(opts, infrastructureTool);
@@ -113,15 +136,63 @@ export function infrastructureSpecs(opts: Opts): Spec[] {
     ...opts,
     "node-count": utils.nodeCount(opts),
     "digitalocean-ssh-sources-json":
-      JSON.stringify(opts["digitalocean-ssh-sources"]),
+      JSON.stringify(compute.cidrs(opts, "digitalocean-ssh-sources")),
     "digitalocean-client-sources-json":
-      JSON.stringify(opts["digitalocean-client-sources"]),
+      JSON.stringify(compute.cidrs(opts, "digitalocean-client-sources")),
   };
   return [spec(template("infrastructure", "main.tf"), `${dir}/main.tf`, data)];
 }
 
-function outputsMap(result: Opts): Opts {
-  return (result["mysql-ha/outputs"] as Opts | undefined) ?? {};
+// The compute stage's `params` output, as ONCE reads it; undefined when the
+// apply reported none.
+export function outputParams(result: Opts): computeCluster.ClusterParams | undefined {
+  return computeCluster.outputParams({ "tofu/outputs": result["mysql-ha/outputs"] });
+}
+
+const nonBlank = (v: unknown): boolean =>
+  (typeof v === "number" && Number.isInteger(v)) || (typeof v === "string" && v.trim() !== "");
+
+// The extension keys this package puts inside `params`, which ONCE preserves
+// but does not read: a non-blank `reserved_ip` and `vpc_id`, a canonical
+// `vpc_ip_range`, and a non-blank `droplet_id` on every node. A real run is
+// refused without them; the legacy translation is held to the same rule.
+export function paramsErrors(params: computeCluster.ClusterParams): string[] {
+  const errors: string[] = [];
+  for (const k of ["reserved_ip", "vpc_id"]) {
+    if (!nonBlank(params[k])) errors.push(`compute state carries no ${k}`);
+  }
+  if (!nonBlank(params.vpc_ip_range)) {
+    errors.push("compute state carries no vpc_ip_range");
+  } else if (!computeCluster.ipv4Network(params.vpc_ip_range)) {
+    errors.push(`compute state vpc_ip_range ${JSON.stringify(params.vpc_ip_range)}`
+      + " is not a canonical IPv4 network such as 10.40.0.0/24");
+  }
+  const missing = (params.nodes ?? [])
+    .filter((n) => !nonBlank(n.droplet_id))
+    .map((n) => computeCluster.nodeIdStr(n));
+  if (missing.length > 0) {
+    errors.push(`compute state carries no droplet_id for ${missing.join(", ")}`);
+  }
+  return errors;
+}
+
+// `opts` once the adopted cluster passes `paramsErrors`, or the refusal.
+function checked(opts: Opts): Opts {
+  const errors = "once/cluster" in opts
+    ? paramsErrors(opts["once/cluster"] as computeCluster.ClusterParams) : [];
+  return errors.length > 0 ? refuse(opts, errors) : opts;
+}
+
+// What the infrastructure stage hands on after its apply: `result` as it is on
+// a failure, a delete or a build, and otherwise ONCE's `resolvedCluster` over
+// the apply's `params` output — undefined outputs and a partial cluster are
+// refused there — checked against `paramsErrors`. Pure, so the wiring is
+// testable without an apply.
+export function resolveInfrastructure(opts: Opts, result: Opts): Opts {
+  if (failed(result)) return result;
+  if (opts["red/event"] === "delete" || opts["red/event"] === "build") return result;
+  const resolved = computeCluster.resolvedCluster(validate.spec, opts, result, {}, outputParams(result));
+  return failed(resolved) ? resolved : checked(resolved);
 }
 
 export async function infrastructureStep(opts: Opts): Promise<Opts> {
@@ -132,71 +203,133 @@ export async function infrastructureStep(opts: Opts): Promise<Opts> {
       env: credentialEnv(opts, "provider-compute"),
       outputKey: "mysql-ha/outputs",
     });
-  if (failed(result)) return result;
-  if (opts["red/event"] === "delete") return result;
-  if (opts["red/event"] === "build") return { ...result, ...fallbackOutputs };
-  return { ...result, ...fallbackOutputs, ...outputsMap(result) };
+  return resolveInfrastructure(opts, result);
 }
 
-export function processResult(
-  opts: Opts, label: string, res: { exit: number; out: string; err: string },
-): Opts {
-  if (res.exit === 0) return { ...opts, "red/exit": 0 };
+// A state written before this package recorded `params`: the parallel
+// `node_public_ips`, `node_private_ips` and `node_droplet_ids` lists, zipped
+// into the nodes the standard describes, with `reserved_ip`, `vpc_id` and
+// `vpc_ip_range` copied and the names this package has always given its
+// members. Refused, as the SDK's `StepError`, when the three lists disagree
+// with each other or with `cluster-nodes` — guessing which droplet is which is
+// how a delete destroys around a member — and when no `reserved_ip` was
+// recorded. A missing `vpc_id` or `vpc_ip_range` is `paramsErrors`' to refuse,
+// the same way for a legacy and a recorded state.
+export function legacyParams(opts: Opts, outputs: Record<string, unknown>): computeCluster.ClusterParams {
+  const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+  const publics = list(outputs.node_public_ips);
+  const privates = list(outputs.node_private_ips);
+  const ids = list(outputs.node_droplet_ids);
+  const n = opts["cluster-nodes"];
+  if (!(n === publics.length && n === privates.length && n === ids.length)) {
+    throw new StepError(`legacy state lists ${publics.length} public addresses, `
+      + `${privates.length} private addresses and ${ids.length} droplet ids; `
+      + "refusing to guess the cluster");
+  }
+  if (!nonBlank(outputs.reserved_ip)) throw new StepError("legacy state carries no reserved_ip");
   return {
-    ...opts,
-    "red/exit": Math.max(1, res.exit),
-    "red/err": `${label} failed: ${res.err || res.out || "(no output)"}`,
+    provider: validate.defaultComputeProvider,
+    reserved_ip: outputs.reserved_ip,
+    vpc_id: outputs.vpc_id,
+    vpc_ip_range: outputs.vpc_ip_range,
+    nodes: Array.from({ length: n as number }, (_, i) => ({
+      index: i,
+      role: null,
+      name: utils.nodeName(opts, i + 1),
+      ip: publics[i] as string,
+      vpc_ip: privates[i] as string,
+      droplet_id: ids[i],
+      user: "root",
+      sudoer: "root",
+    })),
   };
 }
 
-// Read node addresses out of remote state without planning or changing
-// anything. Delete and health both need the inventory and neither can
-// re-derive it; `k8s` needs the same thing for the same reason.
-export async function loadInfrastructureStep(opts: Opts): Promise<Opts> {
+// The reader ONCE's `readState` takes: the compute `params` recorded in the
+// infrastructure state, undefined when the state is readable and holds
+// nothing, and the legacy translation when it holds only the pre-adoption
+// outputs. Delete and health both need the cluster and neither can re-derive
+// it — nor can a fresh clone, so the stage is rendered, its backend written
+// and initialized here, before the read. A failed initialization throws the
+// SDK's `StepError`, the shape `red/tofu` throws on an unreadable backend;
+// `readState` reports both fail-closed. Injectable into `startStep` and
+// `loadInfrastructureStep`, so tests never shell out to tofu.
+export async function stateOutput(opts: Opts): Promise<computeCluster.ClusterParams | undefined> {
   const dir = toolDir(opts, infrastructureTool);
-  const rendered: Opts = {
-    ...scaffold({ ...opts, "red/event": "build" }, infrastructureSpecs(opts)),
-    "red/event": opts["red/event"],
-  };
   const env = credentialEnv(opts, "provider-compute");
+  scaffold({ ...opts, "red/event": "build" }, infrastructureSpecs(opts));
+  await backendAdvice(infrastructureTool)(opts);
   const init = await runtime.exec(
     ["tofu", `-chdir=${dir}`, "init", "-input=false", "-no-color"], { env });
   if (init.exit !== 0) {
-    return processResult(rendered, "infrastructure state initialization", init);
+    throw new StepError(`infrastructure state initialization failed: ${init.err || init.out || "(no output)"}`);
   }
-  try {
-    const outputs = await tofu.outputs(dir, env);
-    return {
-      ...rendered, ...fallbackOutputs, ...outputs,
-      "mysql-ha/infrastructure-present?": "reserved_ip" in outputs,
-    };
-  } catch (t) {
-    return {
-      ...rendered,
-      "red/exit": 1,
-      "red/err": `infrastructure state output failed: ${
-        t instanceof Error ? t.message || t.constructor.name : String(t)}`,
-    };
-  }
+  const outputs = await tofu.outputs(dir, env);
+  if ("params" in outputs) return outputs.params as computeCluster.ClusterParams;
+  if (Object.keys(outputs).length === 0) return undefined;
+  return legacyParams(opts, outputs);
+}
+
+// The health refusal when the state is readable and records no cluster: a
+// real run never checks the documentation addresses.
+export const noClusterMessage =
+  "the infrastructure state records no cluster; refusing to check the documentation addresses";
+
+// Adopt the cluster out of remote state without planning or changing anything:
+// ONCE's `adoptState` over the read `startStep` handed on under
+// `mysql-ha/state`, or a fresh read when nothing was. An unreadable backend and
+// a partial cluster fail closed; the adopted `params` must then pass
+// `paramsErrors`. A readable state without a cluster means there is nothing to
+// clean up on a delete and nothing to check on a health.
+export async function loadInfrastructureStep(
+  opts: Opts,
+  reader: compute.StateReader = stateOutput,
+): Promise<Opts> {
+  const event = String(opts["red/event"]);
+  const { "mysql-ha/state": handed, ...rest } = opts;
+  const state = "mysql-ha/state" in opts
+    ? handed as compute.StateRead
+    : await computeCluster.readState(opts, reader);
+  const adopted = computeCluster.adoptState(validate.spec, rest, event, state);
+  const present = "once/cluster" in adopted;
+  if (failed(adopted)) return adopted;
+  if (!present && event === "health") return refuse(adopted, [noClusterMessage]);
+  const result = checked(adopted);
+  if (failed(result)) return result;
+  return { ...result, "mysql-ha/infrastructure-present?": present };
 }
 
 // ---------------------------------------------------------------------------
 // shared template data
 
-// One map per member, in ordinal order, merging desired state with whatever
-// the infrastructure stage reported. Pure: given the same opts it is the same
-// vector, which is what makes the inventory and the goldens deterministic.
+// ONCE's nodes for this deployment: the adopted `params.nodes` on a real run,
+// the fallbacks on a build — renamed to what this package has always called
+// its members and given a documentation droplet id, so the rendered inventory
+// is byte-identical to what it was.
+function clusterNodes(opts: Opts): computeCluster.Node[] {
+  const params = opts["once/cluster"] as computeCluster.ClusterParams | undefined;
+  const members = computeCluster.nodes(validate.spec, opts, params);
+  if (params !== undefined && params !== null) return members;
+  return members.map((node) => ({
+    ...node,
+    name: utils.nodeName(opts, node.index + 1),
+    droplet_id: fallbackDropletId(node.index + 1),
+  }));
+}
+
+// One map per member, in ordinal order: desired state's derivations over the
+// node ONCE reports. Pure: given the same opts it is the same array, which is
+// what makes the inventory and the goldens deterministic.
 export function nodes(opts: Opts): Opts[] {
-  const data = { ...fallbackOutputs, ...opts };
-  return utils.ordinals(opts).map((ordinal) => {
-    const idx = ordinal - 1;
+  return clusterNodes(opts).map((node) => {
+    const ordinal = node.index + 1;
     return {
       ordinal,
-      name: utils.nodeName(opts, ordinal),
+      name: node.name,
       host: utils.nodeHost(opts, ordinal),
-      "public-ip": (data.node_public_ips as unknown[])?.[idx] ?? null,
-      "private-ip": (data.node_private_ips as unknown[])?.[idx] ?? null,
-      "droplet-id": (data.node_droplet_ids as unknown[])?.[idx] ?? null,
+      "public-ip": node.ip ?? null,
+      "private-ip": node.vpc_ip ?? null,
+      "droplet-id": node.droplet_id ?? null,
       "server-id": utils.serverId(ordinal),
       "connection-server-id": utils.connectionServerId(ordinal),
     };
@@ -212,8 +345,14 @@ export function groupSeeds(opts: Opts): string {
     .join(",");
 }
 
+// Template data: desired state over the fallback cluster facts, with the
+// adopted cluster's `reserved_ip`, `vpc_id` and `vpc_ip_range` winning on a
+// real run.
 export function dataFn(opts: Opts): Opts {
-  const data = { ...fallbackOutputs, ...opts };
+  const recorded = (opts["once/cluster"] ?? {}) as Opts;
+  const facts = Object.fromEntries(
+    Object.keys(fallbackOutputs).filter((k) => k in recorded).map((k) => [k, recorded[k]]));
+  const data = { ...fallbackOutputs, ...opts, ...facts };
   return {
     ...data,
     "node-count": utils.nodeCount(opts),
@@ -274,8 +413,9 @@ function pretty(value: unknown, indent = 0): string {
 export function inventory(opts: Opts): string {
   const data = dataFn(opts);
   const keyFile = String(data["digitalocean-ssh-private-key"]);
+  const members = nodes(data);
   const hosts: Record<string, Opts> = Object.fromEntries(
-    nodes(data)
+    members
       .map((node) => [String(node.name), {
         // Key order matches green's sorted-map: alphabetical.
         ansible_host: node["public-ip"],
@@ -290,7 +430,7 @@ export function inventory(opts: Opts): string {
       }] as const)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
   );
-  const bootstrapName = utils.nodeName(opts, 1);
+  const bootstrapName = String(members[0]?.name);
   return pretty({
     all: {
       children: {

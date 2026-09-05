@@ -6,6 +6,12 @@ reserved IP and both firewalls; `mysql-ha-dns` owns the Cloudflare records.
 One Ansible directory holds every playbook, because they share an inventory
 and a set of rendered scripts and splitting them across directories would
 duplicate both.
+
+The cluster itself — which machines exist, at which addresses — is the
+Compute Cluster Standard's `params`, adopted through ONCE's `compute_cluster`
+module and carried under `once/cluster`. This package puts its own facts
+inside it: `reserved_ip`, `vpc_id` and `vpc_ip_range` at the top level, a
+`droplet_id` on every node.
 """
 
 from __future__ import annotations
@@ -20,7 +26,9 @@ from blue.ansible import ansible_step, ansible_with_spec
 from blue.providers import tool_env
 from blue.runtime import runtime
 from blue.scaffold import PRESERVE_JINJA_DELIMITERS, content_spec, scaffold
-from blue.workflow import failed
+from blue.workflow import StepError, failed
+from package_once_blue import compute as once_compute
+from package_once_blue import compute_cluster as cluster
 
 from . import utils, validate
 
@@ -54,6 +62,18 @@ def credential_env(opts: dict, *slots: str) -> dict[str, str] | None:
     return tool_env(validate.providers, opts, [*slots, "provider-backend"])
 
 
+def backend_advice(tool: str):
+    """The state backend of one OpenTofu stage, written before the stage
+    runs. `dir` and `key` are explicit so the state addresses cannot move."""
+    return tofu.conventional_backend_advice(
+        dir=lambda o, tool=tool: tool_dir(o, tool),
+        key=lambda o, tool=tool: f"{o.get('profile')}/{tool}.tfstate")
+
+
+def _refuse(opts: dict, errors: list[str]) -> dict:
+    return {**opts, "blue/exit": 1, "blue/err": "\n".join(errors)}
+
+
 def _compact_json(value) -> str:
     """Cheshire's non-pretty generate-string: no whitespace at all."""
     return json.dumps(value, separators=(",", ":"))
@@ -62,18 +82,23 @@ def _compact_json(value) -> str:
 # ---------------------------------------------------------------------------
 # infrastructure
 
-# Stand-ins so `build` and `--dry-run` render the same shape of file as a real
-# run, without ever reading state or contacting a provider. Documentation-range
-# addresses, so a rendered artifact that leaked into a real run would fail
-# loudly rather than reach something.
+# Stand-ins for the cluster facts beside the nodes, so `build` and `--dry-run`
+# render the same shape of file as a real run without ever reading state or
+# contacting a provider. Documentation-range values, so a rendered artifact
+# that leaked into a real run would fail loudly rather than reach something.
+# The nodes themselves are ONCE's fallbacks, cut from `spec`'s subnet at
+# offset 11.
 fallback_outputs = {
-    "node_public_ips": ["192.0.2.11", "192.0.2.12", "192.0.2.13"],
-    "node_private_ips": ["10.110.0.11", "10.110.0.12", "10.110.0.13"],
-    "node_droplet_ids": [100000001, 100000002, 100000003],
     "reserved_ip": "192.0.2.10",
     "vpc_id": "00000000-0000-0000-0000-000000000000",
     "vpc_ip_range": "10.110.0.0/20",
 }
+
+
+def _fallback_droplet_id(ordinal: int) -> int:
+    """The droplet id a build renders for member `ordinal`; a real run reads
+    every id from state."""
+    return 100000000 + ordinal
 
 
 def infrastructure_specs(opts: dict) -> list[dict]:
@@ -81,14 +106,63 @@ def infrastructure_specs(opts: dict) -> list[dict]:
     data = {**opts,
             "node-count": utils.node_count(opts),
             "digitalocean-ssh-sources-json":
-                _compact_json(opts.get("digitalocean-ssh-sources")),
+                _compact_json(once_compute.cidrs(opts, "digitalocean-ssh-sources")),
             "digitalocean-client-sources-json":
-                _compact_json(opts.get("digitalocean-client-sources"))}
+                _compact_json(once_compute.cidrs(opts, "digitalocean-client-sources"))}
     return [spec(template("infrastructure", "main.tf"), f"{dir}/main.tf", data)]
 
 
-def _outputs_map(result: dict) -> dict:
-    return result.get("mysql-ha/outputs") or {}
+def output_params(result: dict) -> dict | None:
+    """The compute stage's `params` output, as ONCE reads it; None when the
+    apply reported none."""
+    return cluster.output_params({"tofu/outputs": result.get("mysql-ha/outputs")})
+
+
+def _non_blank(v) -> bool:
+    return ((isinstance(v, int) and not isinstance(v, bool))
+            or (isinstance(v, str) and v.strip() != ""))
+
+
+def params_errors(params: dict) -> list[str]:
+    """The extension keys this package puts inside `params`, which ONCE
+    preserves but does not read: a non-blank `reserved_ip` and `vpc_id`, a
+    canonical `vpc_ip_range`, and a non-blank `droplet_id` on every node. A
+    real run is refused without them; the legacy translation is held to the
+    same rule."""
+    errors: list[str] = []
+    for k in ["reserved_ip", "vpc_id"]:
+        if not _non_blank(params.get(k)):
+            errors.append(f"compute state carries no {k}")
+    if not _non_blank(params.get("vpc_ip_range")):
+        errors.append("compute state carries no vpc_ip_range")
+    elif not cluster.ipv4_network(params.get("vpc_ip_range")):
+        errors.append(f"compute state vpc_ip_range {json.dumps(params.get('vpc_ip_range'))}"
+                      " is not a canonical IPv4 network such as 10.40.0.0/24")
+    missing = [cluster.node_id_str(n) for n in (params.get("nodes") or [])
+               if not _non_blank(n.get("droplet_id"))]
+    if missing:
+        errors.append(f"compute state carries no droplet_id for {', '.join(missing)}")
+    return errors
+
+
+def _checked(opts: dict) -> dict:
+    """`opts` once the adopted cluster passes `params_errors`, or the refusal."""
+    errors = params_errors(opts["once/cluster"]) if "once/cluster" in opts else []
+    return _refuse(opts, errors) if errors else opts
+
+
+def resolve_infrastructure(opts: dict, result: dict) -> dict:
+    """What the infrastructure stage hands on after its apply: `result` as it
+    is on a failure, a delete or a build, and otherwise ONCE's
+    `resolved_cluster` over the apply's `params` output — None outputs and a
+    partial cluster are refused there — checked against `params_errors`.
+    Pure, so the wiring is testable without an apply."""
+    if failed(result):
+        return result
+    if opts.get("blue/event") in ("delete", "build"):
+        return result
+    resolved = cluster.resolved_cluster(validate.spec, opts, result, {}, output_params(result))
+    return resolved if failed(resolved) else _checked(resolved)
 
 
 async def infrastructure_step(opts: dict) -> dict:
@@ -97,68 +171,142 @@ async def infrastructure_step(opts: dict) -> dict:
         dir=tool_dir(opts, infrastructure_tool),
         env=credential_env(opts, "provider-compute"),
         output_key="mysql-ha/outputs")
-    if failed(result):
-        return result
-    if opts.get("blue/event") == "delete":
-        return result
-    if opts.get("blue/event") == "build":
-        return {**result, **fallback_outputs}
-    return {**result, **fallback_outputs, **_outputs_map(result)}
+    return resolve_infrastructure(opts, result)
 
 
-def process_result(opts: dict, label: str, res) -> dict:
-    if res.exit == 0:
-        return {**opts, "blue/exit": 0}
-    return {**opts,
-            "blue/exit": max(1, res.exit),
-            "blue/err": f"{label} failed: {res.err or res.out or '(no output)'}"}
+def legacy_params(opts: dict, outputs: dict) -> dict:
+    """A state written before this package recorded `params`: the parallel
+    `node_public_ips`, `node_private_ips` and `node_droplet_ids` lists,
+    zipped into the nodes the standard describes, with `reserved_ip`,
+    `vpc_id` and `vpc_ip_range` copied and the names this package has always
+    given its members. Refused, as the SDK's `StepError`, when the three
+    lists disagree with each other or with `cluster-nodes` — guessing which
+    droplet is which is how a delete destroys around a member — and when no
+    `reserved_ip` was recorded. A missing `vpc_id` or `vpc_ip_range` is
+    `params_errors`' to refuse, the same way for a legacy and a recorded
+    state."""
+    def as_list(v) -> list:
+        return list(v) if isinstance(v, (list, tuple)) else []
+
+    publics = as_list(outputs.get("node_public_ips"))
+    privates = as_list(outputs.get("node_private_ips"))
+    ids = as_list(outputs.get("node_droplet_ids"))
+    n = opts.get("cluster-nodes")
+    if not (n == len(publics) == len(privates) == len(ids)):
+        raise StepError(f"legacy state lists {len(publics)} public addresses, "
+                        f"{len(privates)} private addresses and {len(ids)} droplet ids; "
+                        "refusing to guess the cluster")
+    if not _non_blank(outputs.get("reserved_ip")):
+        raise StepError("legacy state carries no reserved_ip")
+    return {"provider": validate.default_compute_provider,
+            "reserved_ip": outputs.get("reserved_ip"),
+            "vpc_id": outputs.get("vpc_id"),
+            "vpc_ip_range": outputs.get("vpc_ip_range"),
+            "nodes": [{"index": i,
+                       "role": None,
+                       "name": utils.node_name(opts, i + 1),
+                       "ip": publics[i],
+                       "vpc_ip": privates[i],
+                       "droplet_id": ids[i],
+                       "user": "root",
+                       "sudoer": "root"}
+                      for i in range(n)]}
 
 
-async def load_infrastructure_step(opts: dict) -> dict:
-    """Read node addresses out of remote state without planning or changing
-    anything. Delete and health both need the inventory and neither can
-    re-derive it; `k8s` needs the same thing for the same reason."""
+async def state_output(opts: dict) -> dict | None:
+    """The reader ONCE's `read_state` takes: the compute `params` recorded in
+    the infrastructure state, None when the state is readable and holds
+    nothing, and the legacy translation when it holds only the pre-adoption
+    outputs. Delete and health both need the cluster and neither can
+    re-derive it — nor can a fresh clone, so the stage is rendered, its
+    backend written and initialized here, before the read. A failed
+    initialization raises the SDK's `StepError`, the shape `blue.tofu`
+    raises on an unreadable backend; `read_state` reports both fail-closed.
+    Kept local, and looked up on this module at call time, so tests can
+    replace it."""
     dir = tool_dir(opts, infrastructure_tool)
-    rendered = {**scaffold({**opts, "blue/event": "build"}, infrastructure_specs(opts)),
-                "blue/event": opts.get("blue/event")}
     env = credential_env(opts, "provider-compute")
+    scaffold({**opts, "blue/event": "build"}, infrastructure_specs(opts))
+    backend_advice(infrastructure_tool)(opts)
     init = await runtime.exec(
         ["tofu", f"-chdir={dir}", "init", "-input=false", "-no-color"], env=env)
     if init.exit != 0:
-        return process_result(rendered, "infrastructure state initialization", init)
-    try:
-        outputs = await tofu.outputs(dir, env)
-        return {**rendered, **fallback_outputs, **outputs,
-                "mysql-ha/infrastructure-present?": "reserved_ip" in outputs}
-    except Exception as t:  # noqa: BLE001 — mirror green's Throwable catch
-        message = str(t) or type(t).__name__
-        return {**rendered, "blue/exit": 1,
-                "blue/err": f"infrastructure state output failed: {message}"}
+        raise StepError("infrastructure state initialization failed: "
+                        f"{init.err or init.out or '(no output)'}")
+    outputs = await tofu.outputs(dir, env)
+    if "params" in outputs:
+        return outputs["params"]
+    if not outputs:
+        return None
+    return legacy_params(opts, outputs)
+
+
+# The health refusal when the state is readable and records no cluster: a
+# real run never checks the documentation addresses.
+NO_CLUSTER_MESSAGE = ("the infrastructure state records no cluster; "
+                      "refusing to check the documentation addresses")
+
+
+async def load_infrastructure_step(opts: dict) -> dict:
+    """Adopt the cluster out of remote state without planning or changing
+    anything: ONCE's `adopt_state` over the read `start_step` handed on
+    under `mysql-ha/state`, or a fresh read when nothing was. An unreadable
+    backend and a partial cluster fail closed; the adopted `params` must
+    then pass `params_errors`. A readable state without a cluster means
+    there is nothing to clean up on a delete and nothing to check on a
+    health."""
+    event = str(opts.get("blue/event"))
+    if "mysql-ha/state" in opts:
+        state = opts["mysql-ha/state"]
+    else:
+        state = await cluster.read_state(opts, state_output)
+    handed = {k: v for k, v in opts.items() if k != "mysql-ha/state"}
+    adopted = cluster.adopt_state(validate.spec, handed, event, state)
+    present = "once/cluster" in adopted
+    if failed(adopted):
+        return adopted
+    if not present and event == "health":
+        return _refuse(adopted, [NO_CLUSTER_MESSAGE])
+    checked = _checked(adopted)
+    if failed(checked):
+        return checked
+    return {**checked, "mysql-ha/infrastructure-present?": present}
 
 
 # ---------------------------------------------------------------------------
 # shared template data
 
+def _cluster_nodes(opts: dict) -> list[dict]:
+    """ONCE's nodes for this deployment: the adopted `params.nodes` on a real
+    run, the fallbacks on a build — renamed to what this package has always
+    called its members and given a documentation droplet id, so the rendered
+    inventory is byte-identical to what it was."""
+    params = opts.get("once/cluster")
+    nodes = cluster.nodes(validate.spec, opts, params)
+    if params is not None:
+        return list(nodes)
+    return [{**node,
+             "name": utils.node_name(opts, node["index"] + 1),
+             "droplet_id": _fallback_droplet_id(node["index"] + 1)}
+            for node in nodes]
+
+
 def nodes(opts: dict) -> list[dict]:
-    """One map per member, in ordinal order, merging desired state with
-    whatever the infrastructure stage reported. Pure: given the same opts it
-    is the same vector, which is what makes the inventory and the goldens
-    deterministic."""
-    data = {**fallback_outputs, **opts}
-
-    def nth(key: str, idx: int):
-        values = data.get(key)
-        return values[idx] if isinstance(values, (list, tuple)) and idx < len(values) else None
-
-    return [{"ordinal": ordinal,
-             "name": utils.node_name(opts, ordinal),
-             "host": utils.node_host(opts, ordinal),
-             "public-ip": nth("node_public_ips", ordinal - 1),
-             "private-ip": nth("node_private_ips", ordinal - 1),
-             "droplet-id": nth("node_droplet_ids", ordinal - 1),
-             "server-id": utils.server_id(ordinal),
-             "connection-server-id": utils.connection_server_id(ordinal)}
-            for ordinal in utils.ordinals(opts)]
+    """One map per member, in ordinal order: desired state's derivations over
+    the node ONCE reports. Pure: given the same opts it is the same list,
+    which is what makes the inventory and the goldens deterministic."""
+    members = []
+    for node in _cluster_nodes(opts):
+        ordinal = node["index"] + 1
+        members.append({"ordinal": ordinal,
+                        "name": node.get("name"),
+                        "host": utils.node_host(opts, ordinal),
+                        "public-ip": node.get("ip"),
+                        "private-ip": node.get("vpc_ip"),
+                        "droplet-id": node.get("droplet_id"),
+                        "server-id": utils.server_id(ordinal),
+                        "connection-server-id": utils.connection_server_id(ordinal)})
+    return members
 
 
 def group_seeds(opts: dict) -> str:
@@ -170,7 +318,12 @@ def group_seeds(opts: dict) -> str:
 
 
 def data_fn(opts: dict) -> dict:
-    data = {**fallback_outputs, **opts}
+    """Template data: desired state over the fallback cluster facts, with the
+    adopted cluster's `reserved_ip`, `vpc_id` and `vpc_ip_range` winning on a
+    real run."""
+    recorded = opts.get("once/cluster") or {}
+    facts = {k: recorded[k] for k in fallback_outputs if k in recorded}
+    data = {**fallback_outputs, **opts, **facts}
     return {**data,
             "node-count": utils.node_count(opts),
             "backup-prefix": utils.backup_prefix(opts),
@@ -232,6 +385,7 @@ def inventory(opts: dict) -> str:
     group — it carries no meaning once the group exists."""
     data = data_fn(opts)
     key_file = str(data.get("digitalocean-ssh-private-key"))
+    members = nodes(data)
     hosts = {node["name"]: {
         # Key order matches green's sorted-map: alphabetical.
         "ansible_host": node["public-ip"],
@@ -243,8 +397,8 @@ def inventory(opts: dict) -> str:
         "node_ordinal": node["ordinal"],
         "private_ip": node["private-ip"],
         "server_id": node["server-id"],
-    } for node in sorted(nodes(data), key=lambda node: str(node["name"]))}
-    bootstrap_name = utils.node_name(opts, 1)
+    } for node in sorted(members, key=lambda node: str(node["name"]))}
+    bootstrap_name = members[0]["name"] if members else None
     bootstrap = ({bootstrap_name: hosts[bootstrap_name]}
                  if bootstrap_name in hosts else {})
     return _pretty(

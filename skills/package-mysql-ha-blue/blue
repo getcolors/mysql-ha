@@ -6,6 +6,9 @@
 # [tool.uv.sources]
 # package-mysql-ha-blue = { git = "https://github.com/getcolors/mysql-ha.git", rev = "878049385bc8baed3adfdb48d13abea0a5c0e3b7", subdirectory = "blue" }
 # blue = { git = "https://github.com/getcolors/blue.git", rev = "290f313ead5ca162875c33a049c880da017eae09" }
+#
+# [tool.uv]
+# override-dependencies = ["blue @ git+https://github.com/getcolors/blue.git@290f313ead5ca162875c33a049c880da017eae09"]
 # ///
 #
 # Managed by `bb pin` — do not edit by hand, and never invent a SHA.

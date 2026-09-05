@@ -31,6 +31,9 @@
        "# [tool.uv.sources]\n"
        "# package-mysql-ha-blue = { git = \"https://github.com/getcolors/mysql-ha.git\", rev = \"" sha "\", subdirectory = \"blue\" }\n"
        "# blue = { git = \"https://github.com/getcolors/blue.git\", rev = \"290f313ead5ca162875c33a049c880da017eae09\" }\n"
+       "#\n"
+       "# [tool.uv]\n"
+       "# override-dependencies = [\"blue @ git+https://github.com/getcolors/blue.git@290f313ead5ca162875c33a049c880da017eae09\"]\n"
        "# ///"))
 (defn stamp-blue [s sha]
   ;; First stamp is structural: the metadata block gains its git sources and the

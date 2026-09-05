@@ -54,13 +54,28 @@ committed flag.
 
 ## Coupling
 
-The package depends only on the SDK — no ONCE anywhere: it pins Green in
-`green/deps.edn`, the Red SDK in `red/package.json`, and the Blue SDK in
-`blue/pyproject.toml`. Use `MYSQL_HA_LIB_ROOT` (the repository root, for every
-colour; red also accepts the `red/` dir directly) and `GREEN_LIB_ROOT` for
-working-tree development. Final launchers use a pushed SHA managed by `bb pin`
-(run in `green/`), which stamps all three payloads from their unpinned birth
-forms; deployment launchers are copies, not symlinks.
+The package pins the SDK — Green in `green/deps.edn`, the Red SDK in
+`red/package.json`, the Blue SDK in `blue/pyproject.toml` — and ONCE, in the
+same three manifests, for one namespace: `compute-cluster`
+(`io.github.getcolors.once.compute-cluster`, `package-once-red`'s
+`computeCluster`, `package_once_blue.compute_cluster`), the one implementation
+of the Compute Cluster Standard (`workspace/standards/compute-cluster.md`).
+The package owns its `compute-providers` registry, its `spec` (one
+homogeneous role of `cluster-nodes` members, fallback offset 11, the
+`10.110.0.0/20` fallback subnet, a discovered network), its own validators
+and its `params-errors`; ONCE owns selection, the source lists, the network
+and topology checks, the fallback nodes, `read-state`, `adopt-state`,
+`resolved-cluster` and the provider-switch guard. The compute state is the
+template's `params` output — `provider`, `reserved_ip`, `vpc_id`,
+`vpc_ip_range`, and one node per member with its `droplet_id` — adopted
+under `:once/cluster`; a pre-adoption state, which recorded only the parallel
+`node_public_ips`/`node_private_ips`/`node_droplet_ids` lists, is translated
+into the same shape by the reader in `tools`, and refused when the lists
+disagree. Use `MYSQL_HA_LIB_ROOT` (the repository root, for every colour; red
+also accepts the `red/` dir directly), `GREEN_LIB_ROOT` and `ONCE_LIB_ROOT`
+for working-tree development. Final launchers use a pushed SHA managed by
+`bb pin` (run in `green/`), which stamps all three payloads from their
+unpinned birth forms; deployment launchers are copies, not symlinks.
 
 ## Architecture
 
@@ -74,9 +89,13 @@ health  start ─ load-infrastructure ─ health
 `dns` and `base` fork and join at `cluster`. Stage names are remote-state keys
 (`<profile>/mysql-ha-infrastructure.tfstate`) and must not move.
 
-The package depends only on the SDK (Green, and its Red/Blue ports per
-colour). Its own multi-node DigitalOcean template is preferable to coupling to
-ONCE's single-server one, the way `k8s` decided.
+The package keeps its own multi-node DigitalOcean template rather than
+ONCE's single-server one, the way `k8s` decided; what it takes from ONCE is
+the cluster contract over that template, never the template itself. Every
+machine in the account's regional default VPC is inside the cluster's
+east-west trust boundary — the group port and the all-ports VPC rules take
+`data.digitalocean_vpc.cluster.ip_range` as their source — which the standard
+names as a security exception of a discovered network.
 
 Four things are load-bearing and easy to break:
 

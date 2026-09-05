@@ -1,10 +1,13 @@
 // The provider registry and the desired-state rules it drives — the port of
 // io.github.getcolors.mysql-ha.validate.
 //
-// The registry is package-owned rather than inherited from ONCE: this package
-// ships its own multi-node DigitalOcean template, so coupling its validation to
-// ONCE's single-server key set would check for keys no stage here uses and miss
-// the ones it does. `k8s` made the same call for the same reason.
+// The compute registry is package-owned — this package ships its own
+// multi-node DigitalOcean template — and the operations over it are ONCE's
+// `computeCluster` module, the one implementation of the Compute Cluster
+// Standard: selection, the required keys, the source lists, the provider
+// rules, the network mode and the topology are checked there over `spec`,
+// never copied here. What stays here is what only this package knows: the
+// fixed member count, the discovered VPC, and every MySQL rule.
 //
 // Two credentials reach MySQL — the admin password and the replication
 // password — and the design is built to need no third. Nothing in here invents
@@ -17,24 +20,52 @@
 import { parName } from "red/cli";
 import * as providerOps from "red/providers";
 import type { Opts } from "red/workflow";
+import { compute, computeCluster } from "package-once-red";
 import * as utils from "./utils.ts";
 
-// Provider slot -> provider name -> what that choice implies.
+// provider-compute -> what that choice implies.
 //
-// `required` are non-secret keys a template interpolates. `secrets` arrive
+// `required` are non-secret keys the template interpolates. `secrets` arrive
 // only through `COLORS_PAR_*`. `tofuEnv` is the subset OpenTofu reads
 // natively from the process environment, so a credential never has to be
 // rendered into a .tf file sitting in the work directory in plaintext.
-export const providers: providerOps.Registry = {
-  "provider-compute": {
-    digitalocean: {
-      required: ["digitalocean-name", "digitalocean-region",
-                 "digitalocean-size", "digitalocean-image",
-                 "digitalocean-ssh-keys", "digitalocean-vpc-mode"],
-      secrets: ["do-token"],
-      tofuEnv: { "do-token": "DIGITALOCEAN_TOKEN" },
-    },
+// `network` is discovered: the region's default VPC, never one this package
+// owns. `digitalocean-ssh-keys` stays a required literal key; the SSH Keypair
+// Standard is a separate adoption.
+export const computeProviders: computeCluster.ClusterRegistry = {
+  digitalocean: {
+    required: ["digitalocean-name", "digitalocean-region",
+               "digitalocean-size", "digitalocean-image",
+               "digitalocean-ssh-keys", "digitalocean-vpc-mode"],
+    secrets: ["do-token"],
+    tofuEnv: { "do-token": "DIGITALOCEAN_TOKEN" },
+    network: { mode: "discovered" },
   },
+};
+
+// The provider a deployment created before this package recorded one in its
+// compute output must be running: the only one it ever offered.
+export const defaultComputeProvider = "digitalocean";
+
+// How this package describes itself to ONCE's `computeCluster`. One
+// homogeneous role of `cluster-nodes` members, whose fallback addresses start
+// at offset 11 so that `build` renders the same 192.0.2.11-13 and
+// 10.110.0.11-13 it always did, with 192.0.2.10 left to the reserved IP. The
+// fallback subnet stands in for the discovered VPC's range on a build; on a
+// real run the range is the compute state's `vpc_ip_range`.
+export const spec: computeCluster.ClusterSpec = {
+  registry: computeProviders,
+  default: defaultComputeProvider,
+  sources: { nonEmpty: ["ssh-sources", "client-sources"], mayBeEmpty: [] },
+  roles: [{ role: null, countKey: "cluster-nodes", count: 3, fallbackOffset: 11 }],
+  fallbackSubnet: "10.110.0.0/20",
+};
+
+// Provider slot -> provider name -> what that choice implies. The compute slot
+// is the registry above, so the OpenTofu environment and the secrets are read
+// from one place whichever slot a stage asks for.
+export const providers: providerOps.Registry = {
+  "provider-compute": computeProviders,
 
   "provider-dns": {
     cloudflare: {
@@ -59,6 +90,9 @@ export const providers: providerOps.Registry = {
 };
 
 export const slots = ["provider-compute", "provider-dns", "provider-backend"];
+
+// The slots this package selects and checks itself; the compute slot is ONCE's.
+export const ownSlots = ["provider-dns", "provider-backend"];
 
 export const ownRequired = [
   "profile", "workdir",
@@ -97,8 +131,8 @@ export function envErrors(env: Record<string, string | undefined>): string[] {
     : [];
 }
 
-function slotKeys(opts: Opts, field: "required" | "secrets"): string[] {
-  return providerOps.slotKeys(providers, opts, slots, field);
+function slotKeys(opts: Opts, slotNames: string[], field: "required" | "secrets"): string[] {
+  return providerOps.slotKeys(providers, opts, slotNames, field);
 }
 
 function missing(opts: Opts, keys: string[]): string[] {
@@ -109,7 +143,6 @@ export const hostRe =
   /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
 export const uuidRe =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-export const cidrRe = /^[0-9]{1,3}(?:\.[0-9]{1,3}){3}\/[0-9]{1,2}$/;
 export const bufferPoolRe = /^[0-9]+[KMG]$/;
 export const oncalendarRe = /^[-*0-9]+-[-*0-9]+-[-*0-9]+ [:0-9*/]+$/;
 
@@ -122,23 +155,20 @@ function prStr(x: unknown): string {
   return x === undefined || x === null ? "nil" : JSON.stringify(x);
 }
 
-function cidrListErrors(opts: Opts, k: string): string[] {
-  const v = opts[k];
-  if (placeholder(v)) return [];
-  if (!Array.isArray(v)) return [`:${k} must be a list of CIDRs`];
-  if (v.length === 0) return [`:${k} must list at least one CIDR`];
-  return v.flatMap((c) =>
-    cidrRe.test(String(c)) ? [] : [`:${k} entry ${prStr(c)} is not a CIDR`]);
-}
-
 // Everything wrong with `opts` that does not depend on a credential. Empty
-// means the desired state renders.
+// means the desired state renders. The missing keys are this package's, the
+// selected compute provider's (ONCE's `requiredKeys`) and the other slots';
+// the package's own rules follow; the Compute Cluster Standard's — selection,
+// the source lists, the provider and network rules, the topology — are ONCE's
+// over `spec` and come last.
 export function stateErrors(opts: Opts): string[] {
   const errors: string[] = [];
-  for (const key of missing(opts, [...ownRequired, ...slotKeys(opts, "required")])) {
+  for (const key of missing(opts, [...ownRequired,
+                                   ...compute.requiredKeys(spec, opts),
+                                   ...slotKeys(opts, ownSlots, "required")])) {
     errors.push(`:${key} is required`);
   }
-  for (const slot of slots) {
+  for (const slot of ownSlots) {
     const p = opts[slot];
     if (!(typeof p === "string" && p in (providers[slot] ?? {}))) {
       errors.push(`unsupported :${slot} ${prStr(p)}`);
@@ -195,8 +225,7 @@ export function stateErrors(opts: Opts): string[] {
       && String(opts["backup-r2-bucket"]) === String(opts["r2-bucket"])) {
     errors.push(":backup-r2-bucket must not be the state bucket");
   }
-  errors.push(...cidrListErrors(opts, "digitalocean-ssh-sources"));
-  errors.push(...cidrListErrors(opts, "digitalocean-client-sources"));
+  errors.push(...computeCluster.stateErrors(spec, opts));
   return errors;
 }
 
@@ -207,8 +236,8 @@ export function stateErrors(opts: Opts): string[] {
 // provider credentials and none of the database ones.
 export function secretErrors(opts: Opts): string[] {
   const keys = opts["red/event"] === "health"
-    ? slotKeys(opts, "secrets")
-    : [...slotKeys(opts, "secrets"), ...ownSecrets];
+    ? slotKeys(opts, slots, "secrets")
+    : [...slotKeys(opts, slots, "secrets"), ...ownSecrets];
   return [...new Set(missing(opts, keys))]
     .map((key) => `required credential is not set: ${parName(key)}`);
 }

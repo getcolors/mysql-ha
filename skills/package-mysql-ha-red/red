@@ -38,6 +38,7 @@ import { homedir } from "node:os";
 // and break the development symlink at red/red.
 const PINS = {
   "package-mysql-ha-red": "github:getcolors/mysql-ha#878049385bc8baed3adfdb48d13abea0a5c0e3b7",
+  "package-once-red": "github:getcolors/once#b1628b7f8546c10fa9b768565bfd839512cb49ca",
   "red": "github:getcolors/red#db9bfe61282e2093f4098bf5a6ee0cd10added6e",
 };
 

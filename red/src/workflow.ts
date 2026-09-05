@@ -6,21 +6,23 @@
 // Joining DNS there rather than leaving it dangling means a bad zone or a
 // missing token surfaces before any data-plane work starts.
 //
-// Delete and health both begin by reading node addresses out of remote state,
-// because neither can re-derive them.
+// Delete and health both begin by adopting the cluster out of remote state,
+// because neither can re-derive it. The state is read once, in preflight, so
+// the Compute Provider Standard's switch guard runs before the credentials are
+// checked; the read is handed to `load-infrastructure` rather than repeated.
 
 import { parName, readPars } from "red/cli";
 import * as dryRun from "red/dry-run";
-import { preflight } from "red/lifecycle";
+import { preflight, type PreflightContext } from "red/lifecycle";
 import * as progress from "red/progress";
-import * as tofu from "red/tofu";
 import { adviceAdd, workflow, type Opts, type WireDecl } from "red/workflow";
+import { compute, computeCluster } from "package-once-red";
 import * as tools from "./tools.ts";
 import * as validate from "./validate.ts";
 
 export const defaults: Opts = {
   "compute-prevent-destroy": true,
-  "provider-compute": "digitalocean",
+  "provider-compute": validate.defaultComputeProvider,
   "provider-dns": "cloudflare",
   "provider-backend": "local",
   workdir: ".colors",
@@ -30,25 +32,51 @@ export const defaults: Opts = {
 // deliberately absent: a fresh checkout with an empty environment must render.
 export const credentialEvents = ["create", "delete", "health"];
 
+const realCredentialEvent = ({ event, real }: PreflightContext): boolean =>
+  real && credentialEvents.includes(String(event));
+
+// Preflight. On a real create, delete or health the compute state is read
+// once through `reader` — the package's `tools.stateOutput` unless a test
+// injects another — on the same defaulted and overlaid opts the validators
+// see, and only once desired state itself has passed, so the reader never
+// renders an invalid colors.yml. The read feeds the switch guard here and
+// travels on under `mysql-ha/state` for `load-infrastructure` to adopt.
 export async function startStep(
   opts: Opts,
   env: Record<string, string | undefined> = process.env,
+  reader: compute.StateReader = tools.stateOutput,
 ): Promise<Opts> {
+  const overlaid = readPars({ ...defaults, ...opts }, env);
+  const context: PreflightContext = {
+    event: typeof overlaid["red/event"] === "string" ? overlaid["red/event"] as string : undefined,
+    real: !overlaid["red/dry-run"],
+  };
+  const state: compute.StateRead =
+    realCredentialEvent(context)
+      && validate.envErrors(env).length === 0
+      && validate.stateErrors(overlaid).length === 0
+      ? await computeCluster.readState(overlaid, reader)
+      : {};
   return preflight(opts, {
     defaults,
     overlay: readPars,
     validators: [
       (_opts, environment) => validate.envErrors(environment),
       (current) => validate.stateErrors(current),
-      (current, _environment, { event, real }) =>
-        real && credentialEvents.includes(String(event))
-          ? validate.secretErrors(current)
-          : [],
+      // Standard §4 before the credentials: a recorded provider that differs
+      // from the selected one reports the actionable error, not a missing
+      // token for the provider that was just selected.
+      (current, _environment, ctx) => (realCredentialEvent(ctx)
+        ? computeCluster.providerValidator(validate.spec, current, state.params, () => validate.secretErrors(current))
+        : []),
       (current, _environment, { event, real }) =>
         real && event === "delete" && current["compute-prevent-destroy"]
           ? [`compute destruction is protected; set ${parName("compute-prevent-destroy")}=false to delete`]
           : [],
     ],
+    afterValidate: (current, _environment, ctx) => (realCredentialEvent(ctx)
+      ? { ...current, "red/exit": 0, "mysql-ha/state": state }
+      : { ...current, "red/exit": 0 }),
   }, env);
 }
 
@@ -83,11 +111,10 @@ export function wireFn(step: string, runOpts: Opts): WireDecl | undefined {
   return graph[step];
 }
 
+// The state backend of one OpenTofu stage: `tools.backendAdvice`, which the
+// state reader also runs, so a delete from a fresh clone finds its state.
 export function backendAdvice(tool: string) {
-  return tofu.conventionalBackendAdvice({
-    dir: (opts) => tools.toolDir(opts, tool),
-    key: (opts) => `${opts.profile}/${tool}.tfstate`,
-  });
+  return tools.backendAdvice(tool);
 }
 
 export const sideEffecting = [

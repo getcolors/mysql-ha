@@ -1,10 +1,13 @@
 """The provider registry and the desired-state rules it drives — the port of
 io.github.getcolors.mysql-ha.validate.
 
-The registry is package-owned rather than inherited from ONCE: this package
-ships its own multi-node DigitalOcean template, so coupling its validation to
-ONCE's single-server key set would check for keys no stage here uses and miss
-the ones it does. `k8s` made the same call for the same reason.
+The compute registry is package-owned — this package ships its own
+multi-node DigitalOcean template — and the operations over it are ONCE's
+``compute_cluster`` module, the one implementation of the Compute Cluster
+Standard: selection, the required keys, the source lists, the provider
+rules, the network mode and the topology are checked there over ``spec``,
+never copied here. What stays here is what only this package knows: the
+fixed member count, the discovered VPC, and every MySQL rule.
 
 Two credentials reach MySQL — the admin password and the replication
 password — and the design is built to need no third. Nothing in here invents
@@ -22,25 +25,54 @@ import re
 
 from blue import providers as provider_ops
 from blue.cli import par_name
+from package_once_blue import compute as once_compute
+from package_once_blue import compute_cluster as cluster
 
 from . import utils
 
-# Provider slot -> provider name -> what that choice implies.
+# provider-compute -> what that choice implies.
 #
-# `required` are non-secret keys a template interpolates. `secrets` arrive
+# `required` are non-secret keys the template interpolates. `secrets` arrive
 # only through `COLORS_PAR_*`. `tofu-env` is the subset OpenTofu reads
 # natively from the process environment, so a credential never has to be
 # rendered into a .tf file sitting in the work directory in plaintext.
-providers = {
-    "provider-compute": {
-        "digitalocean": {
-            "required": ["digitalocean-name", "digitalocean-region",
-                         "digitalocean-size", "digitalocean-image",
-                         "digitalocean-ssh-keys", "digitalocean-vpc-mode"],
-            "secrets": ["do-token"],
-            "tofu-env": {"do-token": "DIGITALOCEAN_TOKEN"},
-        },
+# `network` is discovered: the region's default VPC, never one this package
+# owns. `digitalocean-ssh-keys` stays a required literal key; the SSH Keypair
+# Standard is a separate adoption.
+compute_providers = {
+    "digitalocean": {
+        "required": ["digitalocean-name", "digitalocean-region",
+                     "digitalocean-size", "digitalocean-image",
+                     "digitalocean-ssh-keys", "digitalocean-vpc-mode"],
+        "secrets": ["do-token"],
+        "tofu-env": {"do-token": "DIGITALOCEAN_TOKEN"},
+        "network": {"mode": "discovered"},
     },
+}
+
+# The provider a deployment created before this package recorded one in its
+# compute output must be running: the only one it ever offered.
+default_compute_provider = "digitalocean"
+
+# How this package describes itself to ONCE's `compute_cluster`. One
+# homogeneous role of `cluster-nodes` members, whose fallback addresses start
+# at offset 11 so that `build` renders the same 192.0.2.11-13 and
+# 10.110.0.11-13 it always did, with 192.0.2.10 left to the reserved IP. The
+# fallback subnet stands in for the discovered VPC's range on a build; on a
+# real run the range is the compute state's `vpc_ip_range`.
+spec: cluster.ClusterSpec = {
+    "registry": compute_providers,
+    "default": default_compute_provider,
+    "sources": {"non_empty": ["ssh-sources", "client-sources"], "may_be_empty": []},
+    "roles": [{"role": None, "count_key": "cluster-nodes", "count": 3, "fallback_offset": 11}],
+    "fallback_subnet": "10.110.0.0/20",
+}
+
+# Provider slot -> provider name -> what that choice implies. The compute slot
+# is the registry above, so the OpenTofu environment and the secrets are read
+# from one place whichever slot a stage asks for.
+providers = {
+    "provider-compute": compute_providers,
 
     "provider-dns": {
         "cloudflare": {
@@ -65,6 +97,9 @@ providers = {
 }
 
 slots = ["provider-compute", "provider-dns", "provider-backend"]
+
+# The slots this package selects and checks itself; the compute slot is ONCE's.
+own_slots = ["provider-dns", "provider-backend"]
 
 own_required = [
     "profile", "workdir",
@@ -109,8 +144,8 @@ def env_errors(env: dict) -> list[str]:
     return []
 
 
-def _slot_keys(opts: dict, field: str) -> list[str]:
-    return provider_ops.slot_keys(providers, opts, slots, field)
+def _slot_keys(opts: dict, slot_names: list[str], field: str) -> list[str]:
+    return provider_ops.slot_keys(providers, opts, slot_names, field)
 
 
 def _missing(opts: dict, keys: list[str]) -> list[str]:
@@ -121,7 +156,6 @@ HOST_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-CIDR_RE = re.compile(r"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}/[0-9]{1,2}$")
 BUFFER_POOL_RE = re.compile(r"^[0-9]+[KMG]$")
 ONCALENDAR_RE = re.compile(r"^[-*0-9]+-[-*0-9]+-[-*0-9]+ [:0-9*/]+$")
 
@@ -136,25 +170,19 @@ def _pr_str(x) -> str:
     return "nil" if x is None else json.dumps(x)
 
 
-def _cidr_list_errors(opts: dict, k: str) -> list[str]:
-    v = opts.get(k)
-    if placeholder(v):
-        return []
-    if not isinstance(v, (list, tuple)):
-        return [f":{k} must be a list of CIDRs"]
-    if not v:
-        return [f":{k} must list at least one CIDR"]
-    return [f":{k} entry {_pr_str(c)} is not a CIDR"
-            for c in v if not CIDR_RE.fullmatch(str(c))]
-
-
 def state_errors(opts: dict) -> list[str]:
     """Everything wrong with `opts` that does not depend on a credential.
-    Empty means the desired state renders."""
+    Empty means the desired state renders. The missing keys are this
+    package's, the selected compute provider's (ONCE's `required_keys`) and
+    the other slots'; the package's own rules follow; the Compute Cluster
+    Standard's — selection, the source lists, the provider and network rules,
+    the topology — are ONCE's over `spec` and come last."""
     errors: list[str] = []
-    for key in _missing(opts, [*own_required, *_slot_keys(opts, "required")]):
+    for key in _missing(opts, [*own_required,
+                               *once_compute.required_keys(spec, opts),
+                               *_slot_keys(opts, own_slots, "required")]):
         errors.append(f":{key} is required")
-    for slot in slots:
+    for slot in own_slots:
         p = opts.get(slot)
         if not (isinstance(p, str) and p in providers.get(slot, {})):
             errors.append(f"unsupported :{slot} {_pr_str(p)}")
@@ -198,8 +226,7 @@ def state_errors(opts: dict) -> list[str]:
             and not placeholder(opts.get("r2-bucket"))
             and str(opts.get("backup-r2-bucket")) == str(opts.get("r2-bucket"))):
         errors.append(":backup-r2-bucket must not be the state bucket")
-    errors.extend(_cidr_list_errors(opts, "digitalocean-ssh-sources"))
-    errors.extend(_cidr_list_errors(opts, "digitalocean-client-sources"))
+    errors.extend(cluster.state_errors(spec, opts))
     return errors
 
 
@@ -209,8 +236,8 @@ def secret_errors(opts: dict) -> list[str]:
     `health` reads remote state and talks to the nodes over SSH; every MySQL
     query it makes runs on the node against its local socket, so it needs the
     provider credentials and none of the database ones."""
-    keys = (_slot_keys(opts, "secrets")
+    keys = (_slot_keys(opts, slots, "secrets")
             if opts.get("blue/event") == "health"
-            else [*_slot_keys(opts, "secrets"), *own_secrets])
+            else [*_slot_keys(opts, slots, "secrets"), *own_secrets])
     return [f"required credential is not set: {par_name(key)}"
             for key in dict.fromkeys(_missing(opts, keys))]

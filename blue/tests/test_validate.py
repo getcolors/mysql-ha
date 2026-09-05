@@ -1,5 +1,6 @@
 from conftest import fixture
 from package_mysql_ha_blue import validate
+from package_once_blue import compute_cluster as cluster
 
 
 def test_the_fixture_is_renderable():
@@ -7,7 +8,8 @@ def test_the_fixture_is_renderable():
 
 
 def test_every_required_key_is_required():
-    for key in validate.own_required:
+    for key in [*validate.own_required,
+                *validate.compute_providers["digitalocean"]["required"]]:
         opts = fixture()
         del opts[key]
         assert any(f"{key} is required" in e
@@ -20,13 +22,35 @@ def test_the_profile_parameter_is_refused():
     assert validate.env_errors({"COLORS_PAR_PROFILE": "somewhere-else"})
 
 
+def test_the_spec_describes_one_homogeneous_role_on_a_discovered_network():
+    # The Compute Cluster Standard's spec is data ONCE reads; this is the one
+    # place its content is asserted, so a drift in any colour is a test
+    # failure and not a rendered surprise.
+    assert cluster.spec_errors(validate.spec) == []
+    assert list(validate.spec["registry"]) == ["digitalocean"]
+    assert validate.spec["default"] == "digitalocean"
+    assert validate.spec["registry"]["digitalocean"]["network"] == {"mode": "discovered"}
+    assert validate.spec["sources"]["non_empty"] == ["ssh-sources", "client-sources"]
+    assert validate.spec["roles"] == [
+        {"role": None, "count_key": "cluster-nodes", "count": 3, "fallback_offset": 11}]
+    assert validate.spec["fallback_subnet"] == "10.110.0.0/20"
+    assert cluster.topology_errors(validate.spec, fixture()) == []
+
+
 def test_the_node_budget_is_three():
     assert validate.state_errors(fixture({"cluster-nodes": 2}))
     assert validate.state_errors(fixture({"cluster-nodes": 5}))
+    # A count that is not a positive integer is ONCE's to refuse too.
+    assert ":cluster-nodes must be a positive integer" in \
+        validate.state_errors(fixture({"cluster-nodes": "3"}))
 
 
 def test_the_vpc_is_never_desired_state():
     assert validate.state_errors(fixture({"digitalocean-vpc-mode": "managed"}))
+    # A pinned VPC is refused by the standard's discovered-network rule.
+    assert validate.state_errors(
+        fixture({"digitalocean-vpc-uuid": "00000000-0000-0000-0000-000000000000"}))
+    assert validate.state_errors(fixture({"digitalocean-vpc-cidr": "10.110.0.0/20"}))
 
 
 def test_the_group_name_must_be_a_uuid():
@@ -54,11 +78,15 @@ def test_backups_may_not_share_the_state_bucket():
 
 
 def test_source_lists_must_be_cidrs():
-    assert validate.state_errors(fixture({"digitalocean-ssh-sources": []}))
+    # The messages are ONCE's: the source lists are the Compute Provider
+    # Standard's, checked over `spec`.
+    assert ":digitalocean-ssh-sources must list at least one CIDR" in \
+        validate.state_errors(fixture({"digitalocean-ssh-sources": []}))
+    assert ':digitalocean-client-sources entry "203.0.113.7" is not an IPv4 or IPv6 CIDR' in \
+        validate.state_errors(fixture({"digitalocean-client-sources": ["203.0.113.7"]}))
+    # A string is a list, the way an overlay carries one.
     assert validate.state_errors(
-        fixture({"digitalocean-client-sources": ["203.0.113.7"]}))
-    assert validate.state_errors(
-        fixture({"digitalocean-ssh-sources": "203.0.113.7/32"}))
+        fixture({"digitalocean-ssh-sources": "203.0.113.7/32, 198.51.100.0/24"})) == []
 
 
 def test_schedules_and_durations_are_checked():
@@ -104,6 +132,7 @@ def test_supplied_credentials_are_not_reported_missing():
 
 
 def test_only_the_providers_this_package_implements_are_accepted():
-    assert validate.state_errors(fixture({"provider-compute": "hcloud"}))
+    assert ":provider-compute must be one of digitalocean" in \
+        validate.state_errors(fixture({"provider-compute": "hcloud"}))
     assert validate.state_errors(fixture({"provider-dns": "yandex"}))
     assert validate.state_errors(fixture({"provider-backend": "local"})) == []

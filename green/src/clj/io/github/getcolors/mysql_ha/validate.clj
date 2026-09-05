@@ -1,10 +1,13 @@
 (ns io.github.getcolors.mysql-ha.validate
   "The provider registry and the desired-state rules it drives.
 
-  The registry is package-owned rather than inherited from ONCE: this package
-  ships its own multi-node DigitalOcean template, so coupling its validation to
-  ONCE's single-server key set would check for keys no stage here uses and miss
-  the ones it does. `k8s` made the same call for the same reason.
+  The compute registry is package-owned — this package ships its own
+  multi-node DigitalOcean template — and the operations over it are ONCE's
+  `compute-cluster` namespace, the one implementation of the Compute Cluster
+  Standard: selection, the required keys, the source lists, the provider
+  rules, the network mode and the topology are checked there over `spec`,
+  never copied here. What stays here is what only this package knows: the
+  fixed member count, the discovered VPC, and every MySQL rule.
 
   Two credentials reach MySQL — the admin password and the replication
   password — and the design is built to need no third. Nothing in here invents
@@ -12,21 +15,50 @@
   (:require [clojure.string :as str]
             [green.cli :as green-cli]
             [green.providers :as provider-ops]
+            [io.github.getcolors.once.compute :as compute]
+            [io.github.getcolors.once.compute-cluster :as cluster]
             [io.github.getcolors.mysql-ha.utils :as utils]))
 
-(def providers
-  "Provider slot -> provider name -> what that choice implies.
+(def compute-providers
+  "provider-compute -> what that choice implies.
 
-  `:required` are non-secret keys a template interpolates. `:secrets` arrive
+  `:required` are non-secret keys the template interpolates. `:secrets` arrive
   only through `COLORS_PAR_*`. `:tofu-env` is the subset OpenTofu reads
   natively from the process environment, so a credential never has to be
-  rendered into a .tf file sitting in the work directory in plaintext."
-  {:provider-compute
-   {"digitalocean" {:required [:digitalocean-name :digitalocean-region
-                               :digitalocean-size :digitalocean-image
-                               :digitalocean-ssh-keys :digitalocean-vpc-mode]
-                    :secrets [:do-token]
-                    :tofu-env {:do-token "DIGITALOCEAN_TOKEN"}}}
+  rendered into a .tf file sitting in the work directory in plaintext.
+  `:network` is `:discovered`: the region's default VPC, never one this
+  package owns. `digitalocean-ssh-keys` stays a required literal key; the SSH
+  Keypair Standard is a separate adoption."
+  {"digitalocean" {:required [:digitalocean-name :digitalocean-region
+                              :digitalocean-size :digitalocean-image
+                              :digitalocean-ssh-keys :digitalocean-vpc-mode]
+                   :secrets [:do-token]
+                   :tofu-env {:do-token "DIGITALOCEAN_TOKEN"}
+                   :network {:mode :discovered}}})
+
+(def default-compute-provider
+  "The provider a deployment created before this package recorded one in its
+  compute output must be running: the only one it ever offered."
+  "digitalocean")
+
+(def spec
+  "How this package describes itself to ONCE's `compute-cluster`. One
+  homogeneous role of `cluster-nodes` members, whose fallback addresses start
+  at offset 11 so that `build` renders the same 192.0.2.11-13 and
+  10.110.0.11-13 it always did, with 192.0.2.10 left to the reserved IP. The
+  fallback subnet stands in for the discovered VPC's range on a build; on a
+  real run the range is the compute state's `vpc_ip_range`."
+  {:registry compute-providers
+   :default default-compute-provider
+   :sources {:non-empty ["ssh-sources" "client-sources"] :may-be-empty []}
+   :roles [{:role nil :count-key :cluster-nodes :count 3 :fallback-offset 11}]
+   :fallback-subnet "10.110.0.0/20"})
+
+(def providers
+  "Provider slot -> provider name -> what that choice implies. The compute
+  slot is the registry above, so the OpenTofu environment and the secrets are
+  read from one place whichever slot a stage asks for."
+  {:provider-compute compute-providers
 
    :provider-dns
    {"cloudflare" {:required [:cloudflare-zone]
@@ -44,6 +76,11 @@
                      :r2-secret-access-key "AWS_SECRET_ACCESS_KEY"}}}})
 
 (def slots [:provider-compute :provider-dns :provider-backend])
+
+(def own-slots
+  "The slots this package selects and checks itself; the compute slot is
+  ONCE's."
+  [:provider-dns :provider-backend])
 
 (def own-required
   [:profile :workdir
@@ -79,7 +116,7 @@
   (when (not-empty (str (get env profile-par)))
     [(str profile-par " is set. mysql-ha takes profile from colors.yml only.")]))
 
-(defn- slot-keys [opts field]
+(defn- slot-keys [opts slots field]
   (provider-ops/slot-keys providers opts slots field))
 
 (defn- missing [opts ks]
@@ -89,30 +126,26 @@
   #"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
 (def uuid-re
   #"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-(def cidr-re #"^[0-9]{1,3}(?:\.[0-9]{1,3}){3}/[0-9]{1,2}$")
 (def buffer-pool-re #"^[0-9]+[KMG]$")
 (def oncalendar-re #"^[-*0-9]+-[-*0-9]+-[-*0-9]+ [:0-9*/]+$")
 
 (defn- positive-int? [x] (and (integer? x) (pos? x)))
 
-(defn- cidr-list-errors [opts k]
-  (let [v (get opts k)]
-    (cond
-      (placeholder? v) nil
-      (not (sequential? v)) [(str k " must be a list of CIDRs")]
-      (empty? v) [(str k " must list at least one CIDR")]
-      :else (for [c v :when (not (re-matches cidr-re (str c)))]
-              (str k " entry " (pr-str c) " is not a CIDR")))))
-
 (defn state-errors
   "Everything wrong with `opts` that does not depend on a credential. Empty
-  means the desired state renders."
+  means the desired state renders. The missing keys are this package's, the
+  selected compute provider's (ONCE's `compute/required-keys`) and the other slots';
+  the package's own rules follow; the Compute Cluster Standard's — selection,
+  the source lists, the provider and network rules, the topology — are ONCE's
+  over `spec` and come last."
   [opts]
   (vec
    (concat
     (map #(str % " is required")
-         (missing opts (concat own-required (slot-keys opts :required))))
-    (for [slot slots
+         (missing opts (concat own-required
+                               (compute/required-keys spec opts)
+                               (slot-keys opts own-slots :required))))
+    (for [slot own-slots
           :let [p (get opts slot)]
           :when (not (contains? (get providers slot) p))]
       (str "unsupported " slot " " (pr-str p)))
@@ -158,8 +191,7 @@
                (not (placeholder? (:r2-bucket opts)))
                (= (str (:backup-r2-bucket opts)) (str (:r2-bucket opts))))
       [":backup-r2-bucket must not be the state bucket"])
-    (cidr-list-errors opts :digitalocean-ssh-sources)
-    (cidr-list-errors opts :digitalocean-client-sources))))
+    (cluster/state-errors spec opts))))
 
 (defn secret-errors
   "Credentials a real run needs that no `COLORS_PAR_*` variable supplied.
@@ -169,7 +201,7 @@
   provider credentials and none of the database ones."
   [opts]
   (let [ks (if (= :health (:green/event opts))
-             (slot-keys opts :secrets)
-             (concat (slot-keys opts :secrets) own-secrets))]
+             (slot-keys opts slots :secrets)
+             (concat (slot-keys opts slots :secrets) own-secrets))]
     (mapv #(str "required credential is not set: " (green-cli/par-name %))
           (distinct (missing opts ks)))))

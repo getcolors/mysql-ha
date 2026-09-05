@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Opts } from "red/workflow";
+import { StepError, type Opts } from "red/workflow";
+import { computeCluster } from "package-once-red";
 import * as tools from "../src/tools.ts";
 import * as utils from "../src/utils.ts";
 import * as validate from "../src/validate.ts";
@@ -14,6 +16,24 @@ function fixture(overrides: Opts = {}): Opts {
   const text = readFileSync(fixtureFile, "utf8");
   return { ...(Bun.YAML.parse(text) as Opts), ...overrides };
 }
+
+// A pre-adoption state exactly as `tofu output -json` parsed it: the six
+// outputs, three parallel lists among them, and no `params`.
+const legacyOutputs: Record<string, unknown> = {
+  node_public_ips: ["203.0.113.11", "203.0.113.12", "203.0.113.13"],
+  node_private_ips: ["10.110.0.5", "10.110.0.6", "10.110.0.7"],
+  node_droplet_ids: [512000001, 512000002, 512000003],
+  reserved_ip: "203.0.113.10",
+  vpc_id: "5a6b7c8d-0000-4000-8000-000000000001",
+  vpc_ip_range: "10.110.0.0/20",
+};
+
+// `params` as the adopted template records it, here through the legacy
+// translation so the two shapes are provably one.
+const recorded = (): computeCluster.ClusterParams => tools.legacyParams(fixture(), legacyOutputs);
+
+const without = (o: Record<string, unknown>, key: string): Record<string, unknown> =>
+  Object.fromEntries(Object.entries(o).filter(([k]) => k !== key));
 
 // --- tools -------------------------------------------------------------------
 
@@ -29,10 +49,162 @@ describe("tools", () => {
     expect([...serverIds].filter((id) => connectionIds.has(id))).toEqual([]);
   });
 
-  test("every member seeds from every member", () => {
-    const seeds = tools.groupSeeds({ ...tools.fallbackOutputs, ...fixture() });
-    expect(seeds.split(",").length).toBe(3);
-    expect(seeds).toContain(":33061");
+  test("build never reads state", () => {
+    // ONCE's fallbacks at offset 11 are the addresses this package always
+    // rendered; documentation range, so a leak fails loudly.
+    expect(tools.nodes(fixture()).map((n) => n["public-ip"]))
+      .toEqual(["192.0.2.11", "192.0.2.12", "192.0.2.13"]);
+    expect(tools.nodes(fixture()).map((n) => n["private-ip"]))
+      .toEqual(["10.110.0.11", "10.110.0.12", "10.110.0.13"]);
+    expect(tools.nodes(fixture()).map((n) => n["droplet-id"]))
+      .toEqual([100000001, 100000002, 100000003]);
+    expect(String(tools.fallbackOutputs.reserved_ip).startsWith("192.0.2.")).toBe(true);
+    expect(tools.dataFn(fixture()).reserved_ip).toBe(tools.fallbackOutputs.reserved_ip);
+  });
+
+  test("a real run reads every node from the adopted cluster", () => {
+    const opts = fixture({ "once/cluster": recorded() });
+    const members = tools.nodes(opts);
+    expect(members.map((n) => n["public-ip"])).toEqual(["203.0.113.11", "203.0.113.12", "203.0.113.13"]);
+    expect(members.map((n) => n["private-ip"])).toEqual(["10.110.0.5", "10.110.0.6", "10.110.0.7"]);
+    expect(members.map((n) => n["droplet-id"])).toEqual([512000001, 512000002, 512000003]);
+    expect(members.map((n) => n.name)).toEqual(["fixture-node-1", "fixture-node-2", "fixture-node-3"]);
+    // The cluster facts beside the nodes come from state too.
+    expect(tools.dataFn(opts).reserved_ip).toBe("203.0.113.10");
+    expect(tools.dataFn(opts).vpc_id).toBe("5a6b7c8d-0000-4000-8000-000000000001");
+    expect(tools.groupSeeds(opts)).toBe("10.110.0.5:33061,10.110.0.6:33061,10.110.0.7:33061");
+    // And reach the inventory and the DNS records.
+    const inv = JSON.parse(tools.inventory(opts));
+    expect(inv.all.children.mysql.hosts["fixture-node-2"].ansible_host).toBe("203.0.113.12");
+    const records = JSON.parse(String((tools.dnsSpecs(opts)[0]!.data as Opts)["node-records-json"]));
+    expect(records["node-3.my-ha.fixture.example"]).toBe("203.0.113.13");
+  });
+
+  test("the legacy state is translated into params", () => {
+    const params = recorded();
+    expect(params.provider).toBe("digitalocean");
+    expect(params.nodes!.map((n) => n.index)).toEqual([0, 1, 2]);
+    expect(params.nodes!.every((n) => n.role === null)).toBe(true);
+    expect(params.nodes!.map((n) => n.name)).toEqual(["fixture-node-1", "fixture-node-2", "fixture-node-3"]);
+    const second = params.nodes![1]!;
+    expect([second.ip, second.vpc_ip, second.droplet_id, second.user, second.sudoer])
+      .toEqual(["203.0.113.12", "10.110.0.6", 512000002, "root", "root"]);
+    expect([params.reserved_ip, params.vpc_id, params.vpc_ip_range])
+      .toEqual(["203.0.113.10", "5a6b7c8d-0000-4000-8000-000000000001", "10.110.0.0/20"]);
+    // ONCE accepts the translation as a whole cluster.
+    expect(computeCluster.nodeErrors(validate.spec, fixture(), params)).toEqual([]);
+    expect(tools.paramsErrors(params)).toEqual([]);
+  });
+
+  test("the legacy translation refuses to guess", () => {
+    const refusal = (outputs: Record<string, unknown>): Error => {
+      try {
+        tools.legacyParams(fixture(), outputs);
+      } catch (e) {
+        return e as Error;
+      }
+      throw new Error("not refused");
+    };
+    // Lists that disagree with each other; the SDK's StepError, so readState
+    // reports it.
+    const e = refusal({ ...legacyOutputs, node_public_ips: ["203.0.113.11", "203.0.113.12"] });
+    expect(e).toBeInstanceOf(StepError);
+    expect(e.message).toBe("legacy state lists 2 public addresses, 3 private addresses and 3 droplet ids; refusing to guess the cluster");
+    // Lists that disagree with cluster-nodes.
+    const four = (v: unknown) => [...(v as unknown[]), (v as unknown[]).at(-1)];
+    expect(refusal({
+      ...legacyOutputs,
+      node_public_ips: four(legacyOutputs.node_public_ips),
+      node_private_ips: four(legacyOutputs.node_private_ips),
+      node_droplet_ids: four(legacyOutputs.node_droplet_ids),
+    }).message).toBe("legacy state lists 4 public addresses, 4 private addresses and 4 droplet ids; refusing to guess the cluster");
+    // No reserved ip.
+    expect(refusal(without(legacyOutputs, "reserved_ip")).message).toBe("legacy state carries no reserved_ip");
+    expect(refusal({ ...legacyOutputs, reserved_ip: "" }).message).toBe("legacy state carries no reserved_ip");
+    // The other extension keys are paramsErrors' to refuse, the same as a
+    // recorded state.
+    expect(tools.paramsErrors(tools.legacyParams(fixture(), without(legacyOutputs, "vpc_id"))))
+      .toEqual(["compute state carries no vpc_id"]);
+  });
+
+  test("params errors hold the extension keys", () => {
+    const params = recorded();
+    expect(tools.paramsErrors(params)).toEqual([]);
+    expect(tools.paramsErrors({ ...params, reserved_ip: " " })).toEqual(["compute state carries no reserved_ip"]);
+    expect(tools.paramsErrors(without(params, "vpc_id"))).toEqual(["compute state carries no vpc_id"]);
+    expect(tools.paramsErrors({ ...params, vpc_ip_range: null })).toEqual(["compute state carries no vpc_ip_range"]);
+    expect(tools.paramsErrors({ ...params, vpc_ip_range: "10.110.0.1/20" }))
+      .toEqual(['compute state vpc_ip_range "10.110.0.1/20" is not a canonical IPv4 network such as 10.40.0.0/24']);
+    const nodes = params.nodes!;
+    const damaged = [nodes[0]!, without(nodes[1]!, "droplet_id") as computeCluster.Node,
+                     { ...nodes[2]!, droplet_id: "" }];
+    expect(tools.paramsErrors({ ...params, nodes: damaged }))
+      .toEqual(["compute state carries no droplet_id for 1, 2"]);
+  });
+
+  test("load-infrastructure adopts the state preflight handed on", async () => {
+    const params = recorded();
+    const load = (event: string, state: unknown) =>
+      tools.loadInfrastructureStep(fixture({ "red/event": event, "mysql-ha/state": state }));
+    // A recorded cluster.
+    let r = await load("delete", { params });
+    expect(r["red/exit"]).toBe(0);
+    expect(r["once/cluster"]).toEqual(params);
+    expect(r["mysql-ha/infrastructure-present?"]).toBe(true);
+    expect("mysql-ha/state" in r).toBe(false);
+    expect(tools.nodes(r).map((n) => n["public-ip"])).toEqual(["203.0.113.11", "203.0.113.12", "203.0.113.13"]);
+    // A readable state that records no cluster.
+    r = await load("delete", { params: undefined });
+    expect(r["red/exit"]).toBe(0);
+    expect(r["mysql-ha/infrastructure-present?"]).toBe(false);
+    expect("once/cluster" in r).toBe(false);
+    // The cleanup has nothing to reach and skips itself.
+    expect((await tools.cleanupStep(r))["red/exit"]).toBe(0);
+    r = await load("health", { params: undefined });
+    expect(r["red/exit"]).toBe(1);
+    expect(r["red/err"]).toBe(tools.noClusterMessage);
+    // An unreadable backend fails closed.
+    r = await load("delete", { error: "tofu output failed: no backend" });
+    expect(r["red/exit"]).toBe(1);
+    expect(String(r["red/err"])).toContain("could not read the infrastructure state for the delete cleanup");
+    expect(String(r["red/err"])).toContain("no backend");
+    expect(String((await load("health", { error: "x" }))["red/err"]))
+      .toContain("could not read the infrastructure state for health");
+    // A partial cluster is refused with ONCE's message.
+    r = await load("delete", { params: { ...params, nodes: params.nodes!.slice(0, 2) } });
+    expect(r["red/exit"]).toBe(1);
+    expect(r["red/err"]).toBe("the compute stage did not report nodes this package declares: 2");
+    // An adopted cluster without its extension keys is refused.
+    r = await load("delete", { params: without(params, "vpc_id") });
+    expect(r["red/exit"]).toBe(1);
+    expect(r["red/err"]).toBe("compute state carries no vpc_id");
+  });
+
+  test("a real create resolves the cluster from the apply", () => {
+    // The apply's `params` output is what every later stage reads; never the
+    // fallbacks.
+    const params = recorded();
+    const opts = fixture({ "red/event": "create" });
+    const apply = (p: unknown) => tools.resolveInfrastructure(opts, {
+      ...opts, "red/exit": 0, ...(p === undefined ? {} : { "mysql-ha/outputs": { params: p } }),
+    });
+    let r = apply(params);
+    expect(r["red/exit"]).toBe(0);
+    expect(r["once/cluster"]).toEqual(params);
+    expect(tools.nodes(r).map((n) => n["public-ip"])).toEqual(["203.0.113.11", "203.0.113.12", "203.0.113.13"]);
+    r = apply(undefined);
+    expect(r["red/exit"]).toBe(1);
+    expect(r["red/err"]).toBe(computeCluster.noParamsMessage);
+    r = apply({ ...params, nodes: params.nodes!.slice(0, 2) });
+    expect(r["red/exit"]).toBe(1);
+    expect(r["red/err"]).toBe("the compute stage did not report nodes this package declares: 2");
+    r = apply({ ...params, nodes: params.nodes!.map((n) => without(n, "droplet_id")) });
+    expect(r["red/exit"]).toBe(1);
+    expect(r["red/err"]).toBe("compute state carries no droplet_id for 0, 1, 2");
+    // A failed apply, a delete and a build hand the result on untouched.
+    expect(tools.resolveInfrastructure(opts, { ...opts, "red/exit": 1, "red/err": "apply failed" })["red/exit"]).toBe(1);
+    expect("once/cluster" in tools.resolveInfrastructure({ ...opts, "red/event": "build" }, { ...opts, "red/exit": 0 })).toBe(false);
+    expect(tools.resolveInfrastructure({ ...opts, "red/event": "delete" }, { ...opts, "red/exit": 0 })["red/exit"]).toBe(0);
   });
 
   test("the inventory names both groups", () => {
@@ -49,14 +221,6 @@ describe("tools", () => {
 
   test("the inventory is byte-stable", () => {
     expect(tools.inventory(fixture())).toBe(tools.inventory(fixture()));
-  });
-
-  test("build never reads state", () => {
-    // Fallback addresses are documentation range, so a leak fails loudly.
-    for (const ip of tools.fallbackOutputs.node_public_ips as string[]) {
-      expect(ip.startsWith("192.0.2.")).toBe(true);
-    }
-    expect(String(tools.fallbackOutputs.reserved_ip).startsWith("192.0.2.")).toBe(true);
   });
 
   test("stage directories are remote-state keys", () => {
@@ -96,6 +260,15 @@ describe("tools", () => {
     ]);
   });
 
+  test("the source lists reach the template as JSON lists", () => {
+    const data = tools.infrastructureSpecs(fixture())[0]!.data as Opts;
+    expect(data["digitalocean-ssh-sources-json"]).toBe('["203.0.113.7/32"]');
+    // An overlay string renders the same list.
+    const overlaid = tools.infrastructureSpecs(
+      fixture({ "digitalocean-client-sources": "203.0.113.7/32, 198.51.100.0/24" }))[0]!.data as Opts;
+    expect(overlaid["digitalocean-client-sources-json"]).toBe('["203.0.113.7/32","198.51.100.0/24"]');
+  });
+
   test("the backup prefix never carries a trailing slash", () => {
     expect(utils.backupPrefix(fixture())).toBe("mysql-ha-fixture");
     expect(utils.backupPrefix({ "backup-r2-prefix": "a/b//" })).toBe("a/b");
@@ -110,7 +283,7 @@ describe("validate", () => {
   });
 
   test("every required key is required", () => {
-    for (const key of validate.ownRequired) {
+    for (const key of [...validate.ownRequired, ...validate.computeProviders.digitalocean!.required]) {
       const opts = fixture();
       delete opts[key];
       expect(validate.stateErrors(opts).some((e) => e.includes(`${key} is required`)))
@@ -125,13 +298,35 @@ describe("validate", () => {
       .toBeGreaterThan(0);
   });
 
+  test("the spec describes one homogeneous role on a discovered network", () => {
+    // The Compute Cluster Standard's spec is data ONCE reads; this is the one
+    // place its content is asserted, so a drift in any colour is a test
+    // failure and not a rendered surprise.
+    expect(computeCluster.specErrors(validate.spec)).toEqual([]);
+    expect(Object.keys(validate.spec.registry)).toEqual(["digitalocean"]);
+    expect(validate.spec.default).toBe("digitalocean");
+    expect(validate.spec.registry.digitalocean!.network).toEqual({ mode: "discovered" });
+    expect(validate.spec.sources.nonEmpty).toEqual(["ssh-sources", "client-sources"]);
+    expect(validate.spec.roles).toEqual([{ role: null, countKey: "cluster-nodes", count: 3, fallbackOffset: 11 }]);
+    expect(validate.spec.fallbackSubnet).toBe("10.110.0.0/20");
+    expect(computeCluster.topologyErrors(validate.spec, fixture())).toEqual([]);
+  });
+
   test("the node budget is three", () => {
     expect(validate.stateErrors(fixture({ "cluster-nodes": 2 })).length).toBeGreaterThan(0);
     expect(validate.stateErrors(fixture({ "cluster-nodes": 5 })).length).toBeGreaterThan(0);
+    // A count that is not a positive integer is ONCE's to refuse too.
+    expect(validate.stateErrors(fixture({ "cluster-nodes": "3" })))
+      .toContain(":cluster-nodes must be a positive integer");
   });
 
   test("the VPC is never desired state", () => {
     expect(validate.stateErrors(fixture({ "digitalocean-vpc-mode": "managed" })).length)
+      .toBeGreaterThan(0);
+    // A pinned VPC is refused by the standard's discovered-network rule.
+    expect(validate.stateErrors(fixture({ "digitalocean-vpc-uuid": "00000000-0000-0000-0000-000000000000" })).length)
+      .toBeGreaterThan(0);
+    expect(validate.stateErrors(fixture({ "digitalocean-vpc-cidr": "10.110.0.0/20" })).length)
       .toBeGreaterThan(0);
   });
 
@@ -167,14 +362,15 @@ describe("validate", () => {
   });
 
   test("source lists must be CIDRs", () => {
-    expect(validate.stateErrors(fixture({ "digitalocean-ssh-sources": [] })).length)
-      .toBeGreaterThan(0);
+    // The messages are ONCE's: the source lists are the Compute Provider
+    // Standard's, checked over `spec`.
+    expect(validate.stateErrors(fixture({ "digitalocean-ssh-sources": [] })))
+      .toContain(":digitalocean-ssh-sources must list at least one CIDR");
+    expect(validate.stateErrors(fixture({ "digitalocean-client-sources": ["203.0.113.7"] })))
+      .toContain(':digitalocean-client-sources entry "203.0.113.7" is not an IPv4 or IPv6 CIDR');
+    // A string is a list, the way an overlay carries one.
     expect(validate.stateErrors(
-      fixture({ "digitalocean-client-sources": ["203.0.113.7"] })).length)
-      .toBeGreaterThan(0);
-    expect(validate.stateErrors(
-      fixture({ "digitalocean-ssh-sources": "203.0.113.7/32" })).length)
-      .toBeGreaterThan(0);
+      fixture({ "digitalocean-ssh-sources": "203.0.113.7/32, 198.51.100.0/24" }))).toEqual([]);
   });
 
   test("schedules and durations are checked", () => {
@@ -226,8 +422,8 @@ describe("validate", () => {
   });
 
   test("only the providers this package implements are accepted", () => {
-    expect(validate.stateErrors(fixture({ "provider-compute": "hcloud" })).length)
-      .toBeGreaterThan(0);
+    expect(validate.stateErrors(fixture({ "provider-compute": "hcloud" })))
+      .toContain(":provider-compute must be one of digitalocean");
     expect(validate.stateErrors(fixture({ "provider-dns": "yandex" })).length)
       .toBeGreaterThan(0);
     expect(validate.stateErrors(fixture({ "provider-backend": "local" }))).toEqual([]);
@@ -240,6 +436,40 @@ const create: Opts = { "red/event": "create" };
 const build: Opts = { "red/event": "build" };
 const del: Opts = { "red/event": "delete" };
 const health: Opts = { "red/event": "health" };
+
+const credentials: Opts = {
+  "mysql-admin-password": "a",
+  "mysql-replication-password": "b",
+  "backup-r2-access-key-id": "c",
+  "backup-r2-secret-access-key": "d",
+  "do-token": "e",
+  "cloudflare-api-token": "f",
+};
+
+// `params` as a converged deployment records it.
+const converged = (): computeCluster.ClusterParams => ({
+  provider: "digitalocean",
+  reserved_ip: "203.0.113.10",
+  vpc_id: "5a6b7c8d-0000-4000-8000-000000000001",
+  vpc_ip_range: "10.110.0.0/20",
+  nodes: [0, 1, 2].map((i) => ({
+    index: i, role: null, name: `fixture-node-${i + 1}`,
+    ip: `203.0.113.1${i + 1}`, vpc_ip: `10.110.0.${5 + i}`,
+    droplet_id: 512000001 + i, user: "root", sudoer: "root",
+  })),
+});
+
+// The compute state is read once per run, through the injectable reader, on a
+// real create, delete or health. Every lifecycle test injects one: undefined
+// is a readable state holding no compute, a map is a recorded `params`, and a
+// throw is a backend that cannot be read.
+const start = (opts: Opts, state: computeCluster.ClusterParams | undefined) =>
+  workflow.startStep(opts, {}, async () => state);
+// The shape `red/tofu` throws: the SDK's StepError. Only that is an unreadable
+// backend; anything else propagates as a defect.
+const startUnreadable = (opts: Opts) =>
+  workflow.startStep(opts, {}, async () => { throw new StepError("tofu output failed: no backend"); });
+const never = async (): Promise<undefined> => { throw new Error("the reader must not run"); };
 
 const nexts = (step: string, runOpts: Opts): string[] =>
   (workflow.wireFn(step, runOpts) ?? []).slice(1).map(String);
@@ -288,8 +518,20 @@ describe("workflow", () => {
     expect(result["red/exit"]).toBe(0);
   });
 
+  test("build and dry-run never read the state", async () => {
+    // A throwing reader proves nothing on these paths reaches the backend.
+    for (const opts of [fixture({ "red/event": "build" }),
+                        fixture({ "red/event": "create", "red/dry-run": true }),
+                        fixture({ "red/event": "delete", "red/dry-run": true }),
+                        fixture({ "red/event": "health", "red/dry-run": true })]) {
+      const r = await startUnreadable(opts);
+      expect(r["red/exit"]).toBe(0);
+      expect("mysql-ha/state" in r).toBe(false);
+    }
+  });
+
   test("a real run refuses without credentials", async () => {
-    const result = await workflow.startStep(fixture({ "red/event": "create" }), {});
+    const result = await start(fixture({ "red/event": "create" }), undefined);
     expect(result["red/exit"]).toBe(2);
     expect(String(result["red/err"])).toContain("COLORS_PAR_MYSQL_ADMIN_PASSWORD");
   });
@@ -305,29 +547,135 @@ describe("workflow", () => {
       fixture({ "red/event": "build" }), { COLORS_PAR_PROFILE: "elsewhere" });
     expect(result["red/exit"]).toBe(2);
     expect(String(result["red/err"])).toContain("COLORS_PAR_PROFILE");
+    // The state is not read for a refused profile, nor for invalid desired
+    // state.
+    const refused = await workflow.startStep(
+      fixture({ "red/event": "delete", "compute-prevent-destroy": false, ...credentials }),
+      { COLORS_PAR_PROFILE: "elsewhere" }, never);
+    expect(refused["red/exit"]).toBe(2);
+    const invalid = await workflow.startStep(
+      fixture({ "red/event": "delete", "cluster-nodes": 2, ...credentials }), {}, never);
+    expect(invalid["red/exit"]).toBe(2);
   });
 
   test("the destroy guard holds and lifts for exactly one run", async () => {
-    const credentials: Opts = {
-      "mysql-admin-password": "a",
-      "mysql-replication-password": "b",
-      "backup-r2-access-key-id": "c",
-      "backup-r2-secret-access-key": "d",
-      "do-token": "e",
-      "cloudflare-api-token": "f",
-    };
-    const held = await workflow.startStep(
-      fixture({ "red/event": "delete", ...credentials }), {});
+    const held = await start(fixture({ "red/event": "delete", ...credentials }), undefined);
     expect(held["red/exit"]).toBe(2);
     expect(String(held["red/err"])).toContain("COMPUTE_PREVENT_DESTROY");
-    const lifted = await workflow.startStep(
+    const lifted = await start(
       fixture({ "red/event": "delete", "compute-prevent-destroy": false, ...credentials }),
-      {});
+      undefined);
     expect(lifted["red/exit"]).toBe(0);
   });
 
   test("defaults do not quietly permit destruction", () => {
     expect(workflow.defaults["compute-prevent-destroy"]).toBe(true);
+  });
+
+  // --- the Compute Cluster Standard's safety boundaries
+
+  test("a provider switch is refused before the credentials", async () => {
+    for (const event of ["create", "delete", "health"]) {
+      const r = await start(fixture({ "red/event": event, "compute-prevent-destroy": false }),
+                            { ...converged(), provider: "vultr" });
+      expect(r["red/exit"]).toBe(2);
+      expect(String(r["red/err"]))
+        .toContain("state holds a vultr machine; set provider-compute back to vultr and delete first");
+      // The validator order is the thing under test: the actionable error,
+      // not a missing token for the provider that was just selected.
+      expect(String(r["red/err"])).not.toContain("required credential is not set");
+    }
+  });
+
+  test("legacy state accepts only the default provider", async () => {
+    // A recorded provider is absent from every pre-adoption state; on the one
+    // provider this package offers that is the default, and the run proceeds
+    // to its credentials. A second provider would be refused by selection
+    // before the state is read, so the other branch of the rule has no
+    // reachable input here.
+    for (const event of ["create", "delete", "health"]) {
+      const r = await start(fixture({ "red/event": event, "compute-prevent-destroy": false }),
+                            without(converged(), "provider"));
+      expect(r["red/exit"]).toBe(2);
+      expect(String(r["red/err"])).not.toContain("state holds");
+      expect(String(r["red/err"])).toContain("required credential is not set");
+    }
+  });
+
+  test("a matching provider passes to the credentials", async () => {
+    const r = await start(fixture({ "red/event": "create" }), converged());
+    expect(r["red/exit"]).toBe(2);
+    expect(String(r["red/err"])).not.toContain("state holds");
+    expect(String(r["red/err"])).toContain("COLORS_PAR_DO_TOKEN");
+  });
+
+  test("an unreadable backend counts as no state on create", async () => {
+    // A fresh clone has no readable state and must still be able to create.
+    const r = await startUnreadable(fixture({ "red/event": "create" }));
+    expect(r["red/exit"]).toBe(2);
+    expect(String(r["red/err"])).not.toContain("could not read");
+    expect(String(r["red/err"])).not.toContain("state holds");
+    expect(String(r["red/err"])).toContain("COLORS_PAR_DO_TOKEN");
+  });
+
+  test("a real create on a fresh work directory reports the credentials, not a crash", async () => {
+    // No reader stub: the real `stateOutput` runs against a work directory
+    // that holds no stage yet, as a fresh clone's does. It renders the stage,
+    // writes its local backend and initializes it, and finds no state — or
+    // fails to launch tofu, which the SDK reports as its StepError. Either way
+    // ONCE's `readState` counts it as no usable state, so the create reports
+    // its credentials instead of crashing.
+    const work = mkdtempSync(join(tmpdir(), "mysql-ha-red-fresh"));
+    try {
+      const result = await workflow.startStep(fixture({ workdir: work, "red/event": "create" }), {});
+      expect(result["red/exit"]).toBe(2);
+      expect(String(result["red/err"])).toContain("COLORS_PAR_DO_TOKEN");
+      expect(String(result["red/err"])).not.toContain("could not read");
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable backend fails a real delete closed", async () => {
+    // Swallowing it is how a teardown ends up converging against 192.0.2.11.
+    // Preflight hands the read on; `load-infrastructure`, the first step after
+    // it and before any side effect, is where the delete stops.
+    const r = await startUnreadable(
+      fixture({ "red/event": "delete", "compute-prevent-destroy": false, ...credentials }));
+    expect(r["red/exit"]).toBe(0);
+    expect(r["mysql-ha/state"]).toEqual({ error: "tofu output failed: no backend" });
+    const loaded = await tools.loadInfrastructureStep(r);
+    expect(loaded["red/exit"]).toBe(1);
+    expect(String(loaded["red/err"])).toContain("could not read the infrastructure state for the delete cleanup");
+    expect(String(loaded["red/err"])).toContain("no backend");
+  });
+
+  test("a real delete adopts the recorded cluster", async () => {
+    const r = await start(
+      fixture({ "red/event": "delete", "compute-prevent-destroy": false, ...credentials }),
+      converged());
+    expect(r["red/exit"]).toBe(0);
+    expect(r["mysql-ha/state"]).toEqual({ params: converged() });
+    const loaded = await tools.loadInfrastructureStep(r);
+    expect(loaded["red/exit"]).toBe(0);
+    expect(loaded["once/cluster"]).toEqual(converged());
+    expect(tools.nodes(loaded).map((n) => n["public-ip"])).toEqual(["203.0.113.11", "203.0.113.12", "203.0.113.13"]);
+    // A readable state without a cluster leaves nothing to clean up.
+    const empty = await tools.loadInfrastructureStep(await start(
+      fixture({ "red/event": "delete", "compute-prevent-destroy": false, ...credentials }), undefined));
+    expect(empty["red/exit"]).toBe(0);
+    expect(empty["mysql-ha/infrastructure-present?"]).toBe(false);
+  });
+
+  test("a partial cluster is refused on a real run", async () => {
+    const params = converged();
+    const r = await start(fixture({ "red/event": "health", ...credentials }),
+                          { ...params, nodes: params.nodes!.slice(0, 2) });
+    // The switch guard reads only the provider.
+    expect(r["red/exit"]).toBe(0);
+    const loaded = await tools.loadInfrastructureStep(r);
+    expect(loaded["red/exit"]).toBe(1);
+    expect(loaded["red/err"]).toBe("the compute stage did not report nodes this package declares: 2");
   });
 
   test("every side-effecting step is skipped by dry-run", () => {
