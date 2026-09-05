@@ -1,0 +1,47 @@
+---
+# Quiesce the members before the droplets are destroyed. Everything here is
+# best-effort: a member that is already gone must not stop a teardown, and a
+# teardown must never be the thing that fails.
+- name: Stop the managed agents
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: false
+  ignore_unreachable: true
+
+  tasks:
+    - name: Stop and disable the timers and the archiver
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - mysql-ha-endpoint.timer
+        - mysql-ha-heartbeat.timer
+        - mysql-ha-binlog-upload.timer
+        - mysql-ha-snapshot.timer
+        - mysql-ha-restore-check.timer
+        - mysql-ha-binlog-archive.service
+      failed_when: false
+
+    - name: Upload whatever binary-log material has not been uploaded yet
+      ansible.builtin.command: /usr/local/bin/mysql-ha-binlog-upload
+      failed_when: false
+      changed_when: true
+
+    - name: Leave the group cleanly so the survivors do not have to expel it
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -e
+          - STOP GROUP_REPLICATION
+      failed_when: false
+      changed_when: true
+
+    - name: Stop MySQL
+      ansible.builtin.systemd_service:
+        name: mysql
+        state: stopped
+      failed_when: false

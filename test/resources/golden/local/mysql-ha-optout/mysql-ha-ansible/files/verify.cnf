@@ -1,0 +1,31 @@
+# Managed by Colors mysql-ha.
+#
+# The scratch server the verified restore builds and throws away. It shares the
+# host's mysqld binary — so the restore is verified against exactly the server
+# version that produced the snapshot — but shares nothing else: its own
+# datadir, its own socket, no network, and a buffer pool small enough to sit
+# beside the real instance on a 4 GB member.
+[mysqld]
+user                     = mysql
+datadir                  = /var/lib/mysql-ha/verify/data
+socket                   = /var/lib/mysql-ha/verify/mysqld.sock
+pid_file                 = /var/lib/mysql-ha/verify/mysqld.pid
+log_error                = /var/lib/mysql-ha/verify/error.log
+tmpdir                   = /var/lib/mysql-ha/verify/tmp
+secure_file_priv         = /var/lib/mysql-ha/verify/tmp
+skip_networking
+skip_name_resolve
+server_id                = 999
+default_time_zone        = '+00:00'
+
+# GTIDs are the whole point: the dump sets GTID_PURGED, and replaying the
+# archived binary logs on top of that skips whatever the dump already had.
+gtid_mode                = ON
+enforce_gtid_consistency = ON
+binlog_format            = ROW
+log_bin                  = /var/lib/mysql-ha/verify/binlog
+log_replica_updates      = ON
+
+innodb_buffer_pool_size  = 128M
+innodb_redo_log_capacity = 67108864
+performance_schema       = OFF

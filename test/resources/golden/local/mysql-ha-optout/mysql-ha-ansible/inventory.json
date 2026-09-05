@@ -1,0 +1,58 @@
+{
+  "all" : {
+    "children" : {
+      "mysql" : {
+        "hosts" : {
+          "fixture-node-1" : {
+            "ansible_host" : "192.0.2.11",
+            "ansible_ssh_private_key_file" : "~/.ssh/id_ed25519",
+            "ansible_user" : "root",
+            "connection_server_id" : 201,
+            "droplet_id" : 100000001,
+            "node_host" : "node-1.my-ha.fixture.example",
+            "node_ordinal" : 1,
+            "private_ip" : "10.110.0.11",
+            "server_id" : 101
+          },
+          "fixture-node-2" : {
+            "ansible_host" : "192.0.2.12",
+            "ansible_ssh_private_key_file" : "~/.ssh/id_ed25519",
+            "ansible_user" : "root",
+            "connection_server_id" : 202,
+            "droplet_id" : 100000002,
+            "node_host" : "node-2.my-ha.fixture.example",
+            "node_ordinal" : 2,
+            "private_ip" : "10.110.0.12",
+            "server_id" : 102
+          },
+          "fixture-node-3" : {
+            "ansible_host" : "192.0.2.13",
+            "ansible_ssh_private_key_file" : "~/.ssh/id_ed25519",
+            "ansible_user" : "root",
+            "connection_server_id" : 203,
+            "droplet_id" : 100000003,
+            "node_host" : "node-3.my-ha.fixture.example",
+            "node_ordinal" : 3,
+            "private_ip" : "10.110.0.13",
+            "server_id" : 103
+          }
+        }
+      },
+      "bootstrap" : {
+        "hosts" : {
+          "fixture-node-1" : {
+            "ansible_host" : "192.0.2.11",
+            "ansible_ssh_private_key_file" : "~/.ssh/id_ed25519",
+            "ansible_user" : "root",
+            "connection_server_id" : 201,
+            "droplet_id" : 100000001,
+            "node_host" : "node-1.my-ha.fixture.example",
+            "node_ordinal" : 1,
+            "private_ip" : "10.110.0.11",
+            "server_id" : 101
+          }
+        }
+      }
+    }
+  }
+}

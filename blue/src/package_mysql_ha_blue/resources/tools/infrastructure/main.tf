@@ -23,7 +23,18 @@ data "digitalocean_vpc" "cluster" {
   region = "<{ digitalocean-region }>"
 }
 
-# Three homogeneous members. They are identical by construction: which one is
+<% if ssh-keygen %># Keygen mode (workspace standards/ssh-keypair.md): the account key is named
+# after the profile and lives in this stack's state, which is what makes its
+# ownership decidable. One key for the cluster, not one per member — the
+# deployment is one thing, and a key per machine would multiply what the
+# standard exists to make singular. Never reference a literal key id here in
+# keygen mode.
+resource "digitalocean_ssh_key" "machine" {
+  name       = "<{ profile }>"
+  public_key = trimspace(file("<{ ssh-public-key-path }>"))
+}
+
+<% endif %># Three homogeneous members. They are identical by construction: which one is
 # primary is decided by the group at run time, not here.
 resource "digitalocean_droplet" "node" {
   count    = <{ node-count }>
@@ -32,8 +43,9 @@ resource "digitalocean_droplet" "node" {
   size     = "<{ digitalocean-size }>"
   image    = "<{ digitalocean-image }>"
   vpc_uuid = data.digitalocean_vpc.cluster.id
-  ssh_keys = ["<{ digitalocean-ssh-keys }>"]
-  tags     = ["colors-mysql-ha", local.name]
+<% if ssh-keygen %>  ssh_keys = [digitalocean_ssh_key.machine.id]
+<% else %>  ssh_keys = ["<{ digitalocean-ssh-keys }>"]
+<% endif %>  tags     = ["colors-mysql-ha", local.name]
 
   lifecycle {
     prevent_destroy = <{ compute-prevent-destroy }>
@@ -132,7 +144,8 @@ output "vpc_ip_range" {
 output "params" {
   value = {
     provider     = "digitalocean"
-    reserved_ip  = digitalocean_reserved_ip.endpoint.ip_address
+<% if ssh-keygen %>    ssh_key_id   = digitalocean_ssh_key.machine.id
+<% endif %>    reserved_ip  = digitalocean_reserved_ip.endpoint.ip_address
     vpc_id       = data.digitalocean_vpc.cluster.id
     vpc_ip_range = data.digitalocean_vpc.cluster.ip_range
     nodes = [for i, d in digitalocean_droplet.node : {

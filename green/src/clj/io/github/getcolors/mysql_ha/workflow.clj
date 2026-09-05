@@ -18,6 +18,8 @@
             [green.progress :as progress]
             [green.workflow :as wf]
             [io.github.getcolors.once.compute-cluster :as cluster]
+            [io.github.getcolors.mysql-ha.ssh :as ssh]
+            [io.github.getcolors.mysql-ha.ssh-config :as ssh-config]
             [io.github.getcolors.mysql-ha.tools :as tools]
             [io.github.getcolors.mysql-ha.validate :as validate]))
 
@@ -71,20 +73,40 @@
             [(str "compute destruction is protected; set "
                   (green-cli/par-name :compute-prevent-destroy) "=false to delete")]))]
        :after-validate
-       (fn [opts _ ctx]
-         (cond-> (assoc opts :green/exit 0)
-           (real-credential-event? ctx) (assoc :mysql-ha/state state)))}
+       ;; The machine key's create matrix and the DigitalOcean preflight run
+       ;; before any template is rendered: an unowned key on disk or at the
+       ;; provider stops the run while stopping is still free. Every other
+       ;; event fills the same template values — a destroy renders before it
+       ;; destroys, a health reaches the members with the key — but checks no
+       ;; key, because the delete's key cleanup runs after the compute destroy.
+       (fn [opts _ {:keys [event real?] :as ctx}]
+         (let [opts (cond-> opts (real-credential-event? ctx) (assoc :mysql-ha/state state))]
+           (if (and real? (= :create event))
+             (let [opts (ssh/ensure-key! opts (fn [_] (:params state)))]
+               (if (wf/failed? opts)
+                 opts
+                 (let [opts (ssh/preflight! (ssh/with-machine-key opts))
+                       opts (if (wf/failed? opts) opts (ssh-config/preflight! opts))]
+                   (if (wf/failed? opts) opts (assoc opts :green/exit 0)))))
+             (assoc (ssh/with-machine-key opts) :green/exit 0))))}
       env))))
 
 (defn wire-fn [step run-opts]
   (case (:green/event run-opts)
     :delete
+    ;; The `~/.ssh/config` block goes before the destroy, the keypair after it.
+    ;; A block that outlives its host is stale but harmless; a key that
+    ;; predeceases its host locks the operator out of members that still
+    ;; exist. Both orders are deliberate — standards/ssh-config.md §4 is
+    ;; explicit that they must not be tidied into agreement.
     (case step
       :mysql-ha/start [start-step :mysql-ha/load-infrastructure]
       :mysql-ha/load-infrastructure [tools/load-infrastructure-step :mysql-ha/cleanup]
-      :mysql-ha/cleanup [tools/cleanup-step :mysql-ha/dns]
+      :mysql-ha/cleanup [tools/cleanup-step :mysql-ha/ansible-local]
+      :mysql-ha/ansible-local [tools/ansible-local-step :mysql-ha/dns]
       :mysql-ha/dns [tools/dns-step :mysql-ha/infrastructure]
-      :mysql-ha/infrastructure [tools/infrastructure-step])
+      :mysql-ha/infrastructure [tools/infrastructure-step :mysql-ha/ssh-cleanup]
+      :mysql-ha/ssh-cleanup [ssh/cleanup-step])
 
     :health
     (case step
@@ -92,9 +114,12 @@
       :mysql-ha/load-infrastructure [tools/load-infrastructure-step :mysql-ha/health]
       :mysql-ha/health [tools/health-step])
 
+    ;; The block is written after compute, where the addresses first exist,
+    ;; and before the members are converged (ssh-config.md §4).
     (case step
       :mysql-ha/start [start-step :mysql-ha/infrastructure]
-      :mysql-ha/infrastructure [tools/infrastructure-step :mysql-ha/dns :mysql-ha/base]
+      :mysql-ha/infrastructure [tools/infrastructure-step :mysql-ha/ansible-local]
+      :mysql-ha/ansible-local [tools/ansible-local-step :mysql-ha/dns :mysql-ha/base]
       :mysql-ha/dns [tools/dns-step :mysql-ha/cluster]
       :mysql-ha/base [tools/base-step :mysql-ha/cluster]
       :mysql-ha/cluster [tools/cluster-step :mysql-ha/backup]
@@ -108,9 +133,9 @@
   (tools/backend-advice tool))
 
 (def side-effecting
-  [:mysql-ha/infrastructure :mysql-ha/load-infrastructure :mysql-ha/dns
-   :mysql-ha/base :mysql-ha/cluster :mysql-ha/backup :mysql-ha/health
-   :mysql-ha/cleanup])
+  [:mysql-ha/infrastructure :mysql-ha/load-infrastructure :mysql-ha/ansible-local
+   :mysql-ha/dns :mysql-ha/base :mysql-ha/cluster :mysql-ha/backup
+   :mysql-ha/health :mysql-ha/cleanup :mysql-ha/ssh-cleanup])
 
 (def workflow
   (-> (reduce (fn [w tool]

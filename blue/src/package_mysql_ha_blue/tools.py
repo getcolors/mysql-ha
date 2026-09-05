@@ -30,10 +30,11 @@ from blue.workflow import StepError, failed
 from package_once_blue import compute as once_compute
 from package_once_blue import compute_cluster as cluster
 
-from . import utils, validate
+from . import ssh, ssh_config, utils, validate
 
 infrastructure_tool = "mysql-ha-infrastructure"
 dns_tool = "mysql-ha-dns"
+ansible_local_tool = "mysql-ha-ansible-local"
 ansible_tool = "mysql-ha-ansible"
 tofu_tools = [infrastructure_tool, dns_tool]
 
@@ -102,6 +103,10 @@ def _fallback_droplet_id(ordinal: int) -> int:
 
 
 def infrastructure_specs(opts: dict) -> list[dict]:
+    # The machine-key paths are filled here as well as in preflight, so the
+    # template renders the same bytes whichever step scaffolds it — the state
+    # reader renders it as a build, and a test may render it alone.
+    opts = ssh.with_machine_key(opts)
     dir = tool_dir(opts, infrastructure_tool)
     data = {**opts,
             "node-count": utils.node_count(opts),
@@ -317,10 +322,20 @@ def group_seeds(opts: dict) -> str:
                     for node in nodes(opts))
 
 
+def private_key_file(data: dict) -> str:
+    """The private key every play reaches the members with: the generated
+    key's path in keygen mode (the build placeholder on a build or a dry-run),
+    the operator's `digitalocean-ssh-private-key` in opt-out mode."""
+    if validate.keygen(data):
+        return str(data.get("ssh-private-key-path"))
+    return str(data.get("digitalocean-ssh-private-key"))
+
+
 def data_fn(opts: dict) -> dict:
     """Template data: desired state over the fallback cluster facts, with the
     adopted cluster's `reserved_ip`, `vpc_id` and `vpc_ip_range` winning on a
-    real run."""
+    real run, and the machine-key paths keygen mode owns."""
+    opts = ssh.with_machine_key(opts)
     recorded = opts.get("once/cluster") or {}
     facts = {k: recorded[k] for k in fallback_outputs if k in recorded}
     data = {**fallback_outputs, **opts, **facts}
@@ -384,7 +399,7 @@ def inventory(opts: dict) -> str:
     holds member one, which is only ever used to pick who bootstraps an empty
     group — it carries no meaning once the group exists."""
     data = data_fn(opts)
-    key_file = str(data.get("digitalocean-ssh-private-key"))
+    key_file = private_key_file(data)
     members = nodes(data)
     hosts = {node["name"]: {
         # Key order matches green's sorted-map: alphabetical.
@@ -404,6 +419,49 @@ def inventory(opts: dict) -> str:
     return _pretty(
         {"all": {"children": {"mysql": {"hosts": hosts},
                               "bootstrap": {"hosts": bootstrap}}}})
+
+
+# ---------------------------------------------------------------------------
+# ssh config (local)
+
+def ansible_local_data(opts: dict) -> dict:
+    """Only what a `build` genuinely knows. Addresses are run-time facts and
+    reach the play as extra-vars instead, so the rendered playbook carries no
+    IP and is identical on every workstation (SSH Config Standard §6)."""
+    return {**opts,
+            "ssh-keygen": validate.keygen(opts),
+            "ssh-config-identity-file": ssh_config.identity_file(opts),
+            "host-alias": ssh_config.host_alias(opts)}
+
+
+def ansible_local_specs(opts: dict) -> list[dict]:
+    dir = tool_dir(opts, ansible_local_tool)
+    data = ansible_local_data(opts)
+    return [spec(template("ansible-local", name), f"{dir}/{name}", data)
+            for name in ["ansible.cfg", "inventory.ini", "main.yml"]]
+
+
+def ssh_config_hosts(opts: dict) -> list[dict]:
+    """The `~/.ssh/config` entries, as data the play loops over: the bare
+    profile pointing at node 0 (the spec's entry), then one alias per member.
+    ONCE's (Compute Cluster Standard §6)."""
+    return cluster.ssh_config_hosts(validate.spec, opts, _cluster_nodes(opts))
+
+
+async def ansible_local_step(opts: dict) -> dict:
+    """Write or remove the `~/.ssh/config` block. The same playbook serves
+    both events; `block_state` is what distinguishes them. Skipped on a delete
+    whose state records no cluster: there is no block to withdraw."""
+    delete = opts.get("blue/event") == "delete"
+    if delete and opts.get("mysql-ha/infrastructure-present?") is False:
+        return {**opts, "blue/exit": 0}
+    return await ansible_with_spec(
+        opts, ansible_local_specs(opts),
+        dir=tool_dir(opts, ansible_local_tool), inventory="inventory.ini",
+        playbooks={"create": "main.yml", "delete": "main.yml"},
+        extra_vars={"host_alias": ssh_config.host_alias(opts),
+                    "ssh_hosts": ssh_config_hosts(opts),
+                    "block_state": "absent" if delete else "present"})
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,33 @@
-from conftest import fixture
+from conftest import fixture, optout
 from package_mysql_ha_blue import validate
 from package_once_blue import compute_cluster as cluster
 
 
 def test_the_fixture_is_renderable():
     assert validate.state_errors(fixture()) == []
+
+
+def test_both_keypair_modes_are_renderable():
+    # The SSH Keypair Standard has two modes and conformance means both hold.
+    assert validate.state_errors(optout()) == []
+    assert validate.keygen(fixture())
+    assert not validate.keygen(optout())
+
+
+def test_the_machine_key_is_never_required():
+    # Its absence is keygen mode, not a missing key.
+    assert not any("digitalocean-ssh-keys" in e for e in validate.state_errors(fixture()))
+
+
+def test_the_private_key_path_is_desired_state_in_opt_out_mode_only():
+    opts = optout()
+    del opts["digitalocean-ssh-private-key"]
+    assert ":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied" \
+        in validate.state_errors(opts)
+    # Keygen mode names the generated key itself and asks for no path.
+    opts = fixture()
+    opts.pop("digitalocean-ssh-private-key", None)
+    assert validate.state_errors(opts) == []
 
 
 def test_every_required_key_is_required():

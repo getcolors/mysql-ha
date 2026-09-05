@@ -33,6 +33,18 @@ default VPC, running MySQL 8.0 in **single-primary Group Replication**.
 | Point-in-time recovery | `mysqlbinlog --read-from-remote-server --stop-never --raw` on every member, uploaded each minute |
 | Verified restore | a scratch `mysqld` rebuilt daily from snapshot + archive, then asserted |
 
+The deployment owns its SSH keypair (the workspace SSH Keypair Standard,
+keygen mode): with no `digitalocean-ssh-keys` in `colors.yml`, the first real
+`create` generates `~/.ssh/<profile>` and `~/.ssh/<profile>.pub`, registers
+the public key at DigitalOcean under the profile's name, and `delete` removes
+the key last, after the droplets are gone. Supplying `digitalocean-ssh-keys`
+(and then `digitalocean-ssh-private-key`, the path to its private half) opts
+out: the package uses the listed key and touches no key material. Either way
+`create` writes one managed block into `~/.ssh/config` with an alias per
+member — `<profile>` for member one, `<profile>-0`, `<profile>-1`,
+`<profile>-2` — and `delete` removes it before the destroy (the workspace SSH
+Config Standard), so `ssh <profile>-1` reaches member two by name.
+
 There is no orchestrator, no keepalived, no etcd, and no fourth machine.
 Failure detection, quorum and election are one mechanism instead of three that
 have to agree with each other.

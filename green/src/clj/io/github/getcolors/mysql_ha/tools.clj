@@ -23,11 +23,14 @@
             [green.workflow :as wf]
             [io.github.getcolors.once.compute :as compute]
             [io.github.getcolors.once.compute-cluster :as cluster]
+            [io.github.getcolors.mysql-ha.ssh :as ssh]
+            [io.github.getcolors.mysql-ha.ssh-config :as ssh-config]
             [io.github.getcolors.mysql-ha.utils :as utils]
             [io.github.getcolors.mysql-ha.validate :as validate]))
 
 (def infrastructure-tool "mysql-ha-infrastructure")
 (def dns-tool "mysql-ha-dns")
+(def ansible-local-tool "mysql-ha-ansible-local")
 (def ansible-tool "mysql-ha-ansible")
 (def tofu-tools [infrastructure-tool dns-tool])
 
@@ -76,7 +79,11 @@
   (+ 100000000 ordinal))
 
 (defn infrastructure-specs [opts]
-  (let [dir (tool-dir opts infrastructure-tool)
+  ;; The machine-key paths are filled here as well as in preflight, so the
+  ;; template renders the same bytes whichever step scaffolds it — the state
+  ;; reader renders it as a build, and a test may render it alone.
+  (let [opts (ssh/with-machine-key opts)
+        dir (tool-dir opts infrastructure-tool)
         data (assoc opts
                     :node-count (utils/node-count opts)
                     :digitalocean-ssh-sources-json
@@ -281,12 +288,22 @@
   (str/join "," (map #(str (:private-ip %) ":" (:mysql-group-port opts))
                      (nodes opts))))
 
+(defn private-key-file
+  "The private key every play reaches the members with: the generated key's
+  path in keygen mode (the build placeholder on a build or a dry-run), the
+  operator's `digitalocean-ssh-private-key` in opt-out mode."
+  [data]
+  (if (validate/keygen? data)
+    (str (:ssh-private-key-path data))
+    (str (:digitalocean-ssh-private-key data))))
+
 (defn data-fn
   "Template data: desired state over the fallback cluster facts, with the
   adopted cluster's `reserved_ip`, `vpc_id` and `vpc_ip_range` winning on a
-  real run."
+  real run, and the machine-key paths keygen mode owns."
   [opts]
-  (let [data (merge fallback-outputs opts
+  (let [opts (ssh/with-machine-key opts)
+        data (merge fallback-outputs opts
                     (select-keys (:once/cluster opts) (keys fallback-outputs)))]
     (assoc data
            :node-count (utils/node-count opts)
@@ -300,7 +317,7 @@
   — it carries no meaning once the group exists."
   [opts]
   (let [data (data-fn opts)
-        key-file (str (:digitalocean-ssh-private-key data))
+        key-file (private-key-file data)
         members (nodes data)
         hosts (into (sorted-map)
                     (map (fn [{:keys [name ordinal public-ip private-ip droplet-id
@@ -321,6 +338,50 @@
             {:mysql {:hosts hosts}
              :bootstrap {:hosts (select-keys hosts [(:name (first members))])}}}}
      {:pretty true})))
+
+;; ---------------------------------------------------------------------------
+;; ssh config (local)
+
+(defn ansible-local-data
+  "Only what a `build` genuinely knows. Addresses are run-time facts and reach
+  the play as extra-vars instead, so the rendered playbook carries no IP and
+  is identical on every workstation (SSH Config Standard §6)."
+  [opts]
+  (assoc opts
+         :ssh-keygen (validate/keygen? opts)
+         :ssh-config-identity-file (ssh-config/identity-file opts)
+         :host-alias (ssh-config/host-alias opts)))
+
+(defn ansible-local-specs [opts]
+  (let [dir (tool-dir opts ansible-local-tool) data (ansible-local-data opts)]
+    [(spec (template "ansible-local" "ansible.cfg") (str dir "/ansible.cfg") data)
+     (spec (template "ansible-local" "inventory.ini") (str dir "/inventory.ini") data)
+     (spec (template "ansible-local" "main.yml") (str dir "/main.yml") data)]))
+
+(defn ssh-config-hosts
+  "The `~/.ssh/config` entries, as data the play loops over: the bare profile
+  pointing at node 0 (the spec's entry), then one alias per member. ONCE's
+  (Compute Cluster Standard §6)."
+  [opts]
+  (cluster/ssh-config-hosts validate/spec opts (cluster-nodes opts)))
+
+(defn ansible-local-step
+  "Write or remove the `~/.ssh/config` block. The same playbook serves both
+  events; `block_state` is what distinguishes them. Skipped on a delete whose
+  state records no cluster: there is no block to withdraw."
+  [opts]
+  (if (and (= :delete (:green/event opts))
+           (false? (:mysql-ha/infrastructure-present? opts)))
+    (assoc opts :green/exit 0)
+    (ansible/ansible-with-spec
+     opts
+     {:dir (tool-dir opts ansible-local-tool)
+      :inventory "inventory.ini"
+      :playbooks {:create "main.yml" :delete "main.yml"}
+      :extra-vars {:host_alias (ssh-config/host-alias opts)
+                   :ssh_hosts (ssh-config-hosts opts)
+                   :block_state (if (= :delete (:green/event opts)) "absent" "present")}}
+     (ansible-local-specs opts))))
 
 ;; ---------------------------------------------------------------------------
 ;; dns

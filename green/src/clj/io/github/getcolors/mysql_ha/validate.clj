@@ -17,6 +17,7 @@
             [green.providers :as provider-ops]
             [io.github.getcolors.once.compute :as compute]
             [io.github.getcolors.once.compute-cluster :as cluster]
+            [io.github.getcolors.once.ssh :as once-ssh]
             [io.github.getcolors.mysql-ha.utils :as utils]))
 
 (def compute-providers
@@ -27,11 +28,13 @@
   natively from the process environment, so a credential never has to be
   rendered into a .tf file sitting in the work directory in plaintext.
   `:network` is `:discovered`: the region's default VPC, never one this
-  package owns. `digitalocean-ssh-keys` stays a required literal key; the SSH
-  Keypair Standard is a separate adoption."
+  package owns. `digitalocean-ssh-keys` is deliberately absent from
+  `:required`: per the SSH Keypair Standard its absence selects keygen mode,
+  and its presence is the opt-out that passes the operator's key ids through
+  untouched."
   {"digitalocean" {:required [:digitalocean-name :digitalocean-region
                               :digitalocean-size :digitalocean-image
-                              :digitalocean-ssh-keys :digitalocean-vpc-mode]
+                              :digitalocean-vpc-mode]
                    :secrets [:do-token]
                    :tofu-env {:do-token "DIGITALOCEAN_TOKEN"}
                    :network {:mode :discovered}}})
@@ -85,8 +88,7 @@
 (def own-required
   [:profile :workdir
    :cluster-host :cluster-nodes
-   :digitalocean-ssh-private-key :digitalocean-ssh-sources
-   :digitalocean-client-sources
+   :digitalocean-ssh-sources :digitalocean-client-sources
    :cloudflare-proxied
    :mysql-port :mysql-group-port :mysql-group-name
    :mysql-admin-user :mysql-replication-user
@@ -106,6 +108,13 @@
    :backup-r2-access-key-id :backup-r2-secret-access-key])
 
 (defn placeholder? [x] (provider-ops/placeholder? x))
+
+(defn keygen?
+  "Whether this deployment owns its machine keypair: `digitalocean-ssh-keys`
+  is absent. Delegates to ONCE, the standard's reference implementation, so
+  one rule decides it everywhere."
+  [opts]
+  (once-ssh/keygen? opts))
 
 (def profile-par (green-cli/par-name :profile))
 
@@ -163,6 +172,12 @@
                   (str/ends-with? (str (:cluster-host opts))
                                   (str "." (:cloudflare-zone opts))))
       [":cluster-host must sit inside :cloudflare-zone"])
+    ;; Opt-out mode reaches the members with the operator's own key, so the
+    ;; path to it is desired state there; keygen mode names the generated key
+    ;; itself and must not be asked for one.
+    (when (and (not (keygen? opts))
+               (placeholder? (:digitalocean-ssh-private-key opts)))
+      [":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied"])
     (when-not (= 3 (:cluster-nodes opts))
       [":cluster-nodes must be 3; a Group Replication majority needs an odd group and the budget is three droplets"])
     (when-not (= "default" (:digitalocean-vpc-mode opts))

@@ -2,7 +2,7 @@ import json
 
 import pytest
 from blue.workflow import StepError
-from conftest import fixture
+from conftest import fixture, optout
 from package_mysql_ha_blue import tools, utils, validate
 from package_once_blue import compute_cluster as cluster
 
@@ -210,8 +210,37 @@ def test_the_inventory_names_both_groups():
     # Bootstrap is only ever member one, and only for an empty group.
     assert children["bootstrap"]["hosts"]["fixture-node-1"] == \
         children["mysql"]["hosts"]["fixture-node-1"]
-    assert children["mysql"]["hosts"]["fixture-node-2"][
+    # The members are reached with the generated key in keygen mode, on a
+    # build through the placeholder, and with the operator's own key in
+    # opt-out mode.
+    built = json.loads(tools.inventory(fixture({"blue/event": "build"})))
+    assert built["all"]["children"]["mysql"]["hosts"]["fixture-node-2"][
+        "ansible_ssh_private_key_file"] == "/home/build-placeholder/.ssh/mysql-ha-fixture"
+    opted_out = json.loads(tools.inventory(optout()))
+    assert opted_out["all"]["children"]["mysql"]["hosts"]["fixture-node-2"][
         "ansible_ssh_private_key_file"] == "~/.ssh/id_ed25519"
+
+
+def test_the_local_stage_writes_one_block_per_alias_and_carries_no_address():
+    data = tools.ansible_local_specs(fixture())[0]["data"]
+    assert data["ssh-keygen"] is True
+    assert data["ssh-config-identity-file"] == "~/.ssh/mysql-ha-fixture"
+    assert data["host-alias"] == "mysql-ha-fixture"
+    # Addresses travel as extra-vars, never through Selmer.
+    assert "ssh_hosts" not in data
+    assert tools.ansible_local_specs(optout())[0]["data"]["ssh-keygen"] is False
+    # The bare alias points at member one, then one alias per member.
+    assert tools.ssh_config_hosts(fixture()) == [
+        {"name": "mysql-ha-fixture", "ip": "192.0.2.11"},
+        {"name": "mysql-ha-fixture-0", "ip": "192.0.2.11"},
+        {"name": "mysql-ha-fixture-1", "ip": "192.0.2.12"},
+        {"name": "mysql-ha-fixture-2", "ip": "192.0.2.13"}]
+
+
+async def test_a_delete_whose_state_records_no_cluster_has_no_block_to_withdraw():
+    r = await tools.ansible_local_step(
+        fixture({"blue/event": "delete", "mysql-ha/infrastructure-present?": False}))
+    assert r["blue/exit"] == 0
 
 
 def test_the_inventory_is_byte_stable():

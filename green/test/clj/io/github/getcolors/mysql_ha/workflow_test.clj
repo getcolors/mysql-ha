@@ -4,11 +4,15 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [green.cli :as green-cli]
+            [io.github.getcolors.mysql-ha.ssh :as ssh]
             [io.github.getcolors.mysql-ha.tools :as tools]
             [io.github.getcolors.mysql-ha.workflow :as workflow]))
 
 (def fixture
   (green-cli/read-state "colors.yml" (slurp "test/fixtures/colors.yml")))
+
+(def optout
+  (green-cli/read-state "optout.yml" (slurp "test/fixtures/optout.yml")))
 
 (def create {:green/event :create})
 (def build {:green/event :build})
@@ -49,9 +53,12 @@
 (defn- nexts [step run-opts]
   (vec (rest (workflow/wire-fn step run-opts))))
 
-(deftest create-forks-at-the-infrastructure-and-joins-at-the-cluster
+(deftest create-forks-after-the-local-ssh-config-and-joins-at-the-cluster
   (is (= [:mysql-ha/infrastructure] (nexts :mysql-ha/start create)))
-  (is (= [:mysql-ha/dns :mysql-ha/base] (nexts :mysql-ha/infrastructure create)))
+  (testing "the block is written after compute, where the addresses first exist, and before any member is converged"
+    (is (= [:mysql-ha/ansible-local] (nexts :mysql-ha/infrastructure create)))
+    (is (= tools/ansible-local-step (first (workflow/wire-fn :mysql-ha/ansible-local create)))))
+  (is (= [:mysql-ha/dns :mysql-ha/base] (nexts :mysql-ha/ansible-local create)))
   (testing "both branches converge on one step, so the engine joins them once"
     (is (= [:mysql-ha/cluster] (nexts :mysql-ha/dns create)))
     (is (= [:mysql-ha/cluster] (nexts :mysql-ha/base create))))
@@ -60,16 +67,34 @@
   (is (= [] (nexts :mysql-ha/health create))))
 
 (deftest build-walks-the-same-graph-as-create
-  (doseq [step [:mysql-ha/start :mysql-ha/infrastructure :mysql-ha/dns
-                :mysql-ha/base :mysql-ha/cluster :mysql-ha/backup]]
+  (doseq [step [:mysql-ha/start :mysql-ha/infrastructure :mysql-ha/ansible-local
+                :mysql-ha/dns :mysql-ha/base :mysql-ha/cluster :mysql-ha/backup]]
     (is (= (nexts step create) (nexts step build)))))
 
 (deftest delete-reads-state-first-and-destroys-in-reverse
   (is (= [:mysql-ha/load-infrastructure] (nexts :mysql-ha/start delete)))
   (is (= [:mysql-ha/cleanup] (nexts :mysql-ha/load-infrastructure delete)))
-  (is (= [:mysql-ha/dns] (nexts :mysql-ha/cleanup delete)))
-  (is (= [:mysql-ha/infrastructure] (nexts :mysql-ha/dns delete)))
-  (is (= [] (nexts :mysql-ha/infrastructure delete))))
+  (testing "the ssh config block goes before the destroy, the keypair after it (ssh-config.md §4)"
+    (is (= [:mysql-ha/ansible-local] (nexts :mysql-ha/cleanup delete)))
+    (is (= [:mysql-ha/dns] (nexts :mysql-ha/ansible-local delete)))
+    (is (= [:mysql-ha/infrastructure] (nexts :mysql-ha/dns delete)))
+    (is (= [:mysql-ha/ssh-cleanup] (nexts :mysql-ha/infrastructure delete)))
+    (is (= ssh/cleanup-step (first (workflow/wire-fn :mysql-ha/ssh-cleanup delete))))
+    (is (= [] (nexts :mysql-ha/ssh-cleanup delete)))))
+
+(deftest a-build-fills-the-placeholder-key-paths
+  ;; Every event fills the machine-key paths in preflight so the templates and
+  ;; the inventory render the same whichever step scaffolds them; a build gets
+  ;; the fixed placeholder, never the operator's home.
+  (let [r (workflow/start-step (assoc fixture :green/event :build) {})]
+    (is (= 0 (:green/exit r)))
+    (is (= "/home/build-placeholder/.ssh/mysql-ha-fixture" (:ssh-private-key-path r)))
+    (is (true? (:ssh-keygen r))))
+  (testing "opt-out invents no key path"
+    (let [r (workflow/start-step (assoc optout :green/event :build) {})]
+      (is (= 0 (:green/exit r)))
+      (is (nil? (:ssh-private-key-path r)))
+      (is (nil? (:ssh-keygen r))))))
 
 (deftest health-changes-nothing
   (is (= [:mysql-ha/load-infrastructure] (nexts :mysql-ha/start health)))
@@ -243,7 +268,7 @@
         _ (is (= 0 (:green/exit result)))
         root (io/file "test/fixtures/.colors/mysql-ha-fixture")]
     (io/delete-file (io/file dir) true)
-    (doseq [stage ["mysql-ha-infrastructure" "mysql-ha-dns" "mysql-ha-ansible"]]
+    (doseq [stage ["mysql-ha-infrastructure" "mysql-ha-ansible-local" "mysql-ha-dns" "mysql-ha-ansible"]]
       (is (.isDirectory (io/file root stage)) stage))
     (testing "the backend is written by advice, before the stage runs"
       (is (.exists (io/file root "mysql-ha-infrastructure" "backend.tf.json")))

@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 from blue.workflow import StepError
-from conftest import ROOT, fixture
-from package_mysql_ha_blue import tools, workflow
+from conftest import ROOT, fixture, optout
+from package_mysql_ha_blue import ssh, tools, workflow
 from package_mysql_ha_blue.cli import run
 
 CREATE = {"blue/event": "create"}
@@ -67,9 +67,13 @@ def nexts(step: str, run_opts: dict) -> list[str]:
     return list((workflow.wire_fn(step, run_opts) or ())[1:])
 
 
-def test_create_forks_at_the_infrastructure_and_joins_at_the_cluster():
+def test_create_forks_after_the_local_ssh_config_and_joins_at_the_cluster():
     assert nexts("mysql-ha/start", CREATE) == ["mysql-ha/infrastructure"]
-    assert nexts("mysql-ha/infrastructure", CREATE) == ["mysql-ha/dns", "mysql-ha/base"]
+    # The block is written after compute, where the addresses first exist,
+    # and before any member is converged.
+    assert nexts("mysql-ha/infrastructure", CREATE) == ["mysql-ha/ansible-local"]
+    assert workflow.wire_fn("mysql-ha/ansible-local", CREATE)[0] is tools.ansible_local_step
+    assert nexts("mysql-ha/ansible-local", CREATE) == ["mysql-ha/dns", "mysql-ha/base"]
     # Both branches converge on one step, so the engine joins them once.
     assert nexts("mysql-ha/dns", CREATE) == ["mysql-ha/cluster"]
     assert nexts("mysql-ha/base", CREATE) == ["mysql-ha/cluster"]
@@ -79,17 +83,37 @@ def test_create_forks_at_the_infrastructure_and_joins_at_the_cluster():
 
 
 def test_build_walks_the_same_graph_as_create():
-    for step in ["mysql-ha/start", "mysql-ha/infrastructure", "mysql-ha/dns",
-                 "mysql-ha/base", "mysql-ha/cluster", "mysql-ha/backup"]:
+    for step in ["mysql-ha/start", "mysql-ha/infrastructure", "mysql-ha/ansible-local",
+                 "mysql-ha/dns", "mysql-ha/base", "mysql-ha/cluster", "mysql-ha/backup"]:
         assert nexts(step, BUILD) == nexts(step, CREATE)
 
 
 def test_delete_reads_state_first_and_destroys_in_reverse():
     assert nexts("mysql-ha/start", DELETE) == ["mysql-ha/load-infrastructure"]
     assert nexts("mysql-ha/load-infrastructure", DELETE) == ["mysql-ha/cleanup"]
-    assert nexts("mysql-ha/cleanup", DELETE) == ["mysql-ha/dns"]
+    # The ssh config block goes before the destroy, the keypair after it
+    # (ssh-config.md §4).
+    assert nexts("mysql-ha/cleanup", DELETE) == ["mysql-ha/ansible-local"]
+    assert nexts("mysql-ha/ansible-local", DELETE) == ["mysql-ha/dns"]
     assert nexts("mysql-ha/dns", DELETE) == ["mysql-ha/infrastructure"]
-    assert nexts("mysql-ha/infrastructure", DELETE) == []
+    assert nexts("mysql-ha/infrastructure", DELETE) == ["mysql-ha/ssh-cleanup"]
+    assert workflow.wire_fn("mysql-ha/ssh-cleanup", DELETE)[0] is ssh.cleanup_step
+    assert nexts("mysql-ha/ssh-cleanup", DELETE) == []
+
+
+async def test_a_build_fills_the_placeholder_key_paths():
+    # Every event fills the machine-key paths in preflight so the templates
+    # and the inventory render the same whichever step scaffolds them; a build
+    # gets the fixed placeholder, never the operator's home.
+    r = await workflow.start_step(fixture(BUILD), env={})
+    assert r["blue/exit"] == 0
+    assert r["ssh-private-key-path"] == "/home/build-placeholder/.ssh/mysql-ha-fixture"
+    assert r["ssh-keygen"] is True
+    # Opt-out invents no key path.
+    o = await workflow.start_step(optout(BUILD), env={})
+    assert o["blue/exit"] == 0
+    assert "ssh-private-key-path" not in o
+    assert "ssh-keygen" not in o
 
 
 def test_health_changes_nothing():
@@ -279,7 +303,7 @@ async def test_a_whole_build_renders_every_stage():
     result = await run("build", "-f", str(ROOT / "test" / "fixtures" / "colors.yml"))
     assert result["blue/exit"] == 0
     root = ROOT / "test" / "fixtures" / ".colors" / "mysql-ha-fixture"
-    for stage in ["mysql-ha-infrastructure", "mysql-ha-dns", "mysql-ha-ansible"]:
+    for stage in ["mysql-ha-infrastructure", "mysql-ha-ansible-local", "mysql-ha-dns", "mysql-ha-ansible"]:
         assert (root / stage).is_dir(), stage
     # The backend is written by advice, before the stage runs.
     assert (root / "mysql-ha-infrastructure" / "backend.tf.json").exists()

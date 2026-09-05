@@ -1,0 +1,414 @@
+---
+# Form the Group Replication group. Bootstrapping is the only genuinely
+# dangerous operation in this package — a member that bootstraps while the
+# group is alive elsewhere becomes a second group of one, and the two diverge
+# silently. So it happens exactly once, from one member, and only after every
+# member has reported that it can see no ONLINE member anywhere.
+
+- name: Prepare every member to join
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Ask this member what it can see of the group
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT COUNT(*) FROM performance_schema.replication_group_members
+            WHERE MEMBER_STATE = 'ONLINE'
+      register: gr_online
+      changed_when: false
+
+    - name: Ask whether this member has ever applied a transaction from the group
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - "SELECT GTID_SUBSET('9f8c1d7e-0e6a-4c2b-9a54-6f1b2c3d4e5f:1', @@GLOBAL.gtid_executed)"
+      register: gr_seen
+      changed_when: false
+
+    # A stock Ubuntu server writes anonymous transactions into its first binary
+    # log before this package's configuration turns GTIDs on, and distributed
+    # recovery refuses a donor whose log contains them. Clearing the log is
+    # therefore part of preparing a *fresh* member — and the guard is a fact
+    # about the data, not a marker file that can lie: once the group has
+    # committed anything at all, this member's gtid_executed contains
+    # <group>:1 and this task can never run again.
+    - name: Clear the binary log of a member that has never seen the group
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -e
+          - RESET MASTER
+      when:
+        - gr_seen.stdout | trim == '0'
+        - gr_online.stdout | trim == '0'
+      changed_when: true
+
+    # WHERE AN ACCOUNT IS CREATED DEPENDS ON WHAT THIS MEMBER IS
+    #
+    # A member that has not joined the group yet is writable, and its accounts
+    # must exist before it joins — so they are created locally, with the binary
+    # log off, and never travel through a group that does not exist yet.
+    #
+    # A member that is already an ONLINE SECONDARY is `super_read_only`: any DDL
+    # there is ERROR 1290, and it does not need any, because the accounts reach
+    # it by replication. It does nothing.
+    #
+    # The PRIMARY of a live group reconciles them *with* the binary log on, so
+    # that a rotated password reaches the whole group.
+    #
+    # This is decided inside the script rather than in a `when:`, so that the
+    # three cases are stated once, next to the statements they govern.
+    #
+    # The password is escaped in the shell rather than interpolated by the
+    # templating layer, so a quote or a backslash in it is data instead of
+    # syntax.
+    #
+    # THE 32-CHARACTER CHANNEL LIMIT
+    #
+    # MySQL refuses a replication-channel password longer than 32 characters,
+    # in both CHANGE REPLICATION SOURCE (ERROR 3056) and START GROUP_REPLICATION
+    # (ERROR 3972). There is no way around it, and distributed recovery is a
+    # replication channel.
+    #
+    # So the replication *account* does not carry the operator's secret
+    # verbatim: it carries the first 128 bits of its SHA-256, as 32 hex
+    # characters. No second credential is invented, nothing is hardcoded, and
+    # nothing is weakened — a truncation of the operator's password would leak
+    # a prefix of it, whereas this leaks nothing and is 128 bits of entropy
+    # inside a VPC-only account. It is also, being hex, immune to every quoting
+    # hazard in the statements below.
+    #
+    # Every place that authenticates as this account derives it the same way,
+    # in Ansible, so there is one implementation of the derivation.
+    - name: Create the replication account on every member
+      ansible.builtin.shell: |
+        set -euo pipefail
+        esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+        role=$(mysql --protocol=socket --user=root -N -B -e "SELECT COALESCE((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'), 'UNJOINED')")
+        case "$role" in
+          UNJOINED) logbin=0 ;;
+          PRIMARY)  logbin=1 ;;
+          *)        echo "ONLINE ${role}: these accounts arrive by replication"; exit 0 ;;
+        esac
+        pw=$(esc "$REPL_PASSWORD")
+        mysql --protocol=socket --user=root <<SQL
+        SET SESSION sql_log_bin = ${logbin};
+        CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '${pw}';
+        ALTER USER 'repl'@'%' IDENTIFIED BY '${pw}';
+        GRANT REPLICATION SLAVE, REPLICATION CLIENT, BACKUP_ADMIN,
+              CONNECTION_ADMIN, GROUP_REPLICATION_STREAM ON *.* TO 'repl'@'%';
+        SET SESSION sql_log_bin = 1;
+        SQL
+      args:
+        executable: /bin/bash
+      environment:
+        # See "the 32-character channel limit" below.
+        REPL_PASSWORD: "{{ (lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') | hash('sha256'))[:32] }}"
+      no_log: true
+      changed_when: true
+      register: repl_account
+      failed_when: false
+
+    # MySQL's own error text, which never echoes the password back.
+    - name: Report why it failed
+      ansible.builtin.fail:
+        msg: "{{ repl_account.stderr | default(repl_account.msg) | default('failed') }}"
+      when: repl_account is not skipped and (repl_account.rc | default(1)) != 0
+
+    - name: Create the administrative account on every member
+      ansible.builtin.shell: |
+        set -euo pipefail
+        esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+        role=$(mysql --protocol=socket --user=root -N -B -e "SELECT COALESCE((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'), 'UNJOINED')")
+        case "$role" in
+          UNJOINED) logbin=0 ;;
+          PRIMARY)  logbin=1 ;;
+          *)        echo "ONLINE ${role}: these accounts arrive by replication"; exit 0 ;;
+        esac
+        pw=$(esc "$ADMIN_PASSWORD")
+        mysql --protocol=socket --user=root <<SQL
+        SET SESSION sql_log_bin = ${logbin};
+        CREATE USER IF NOT EXISTS 'admin'@'%' IDENTIFIED BY '${pw}';
+        ALTER USER 'admin'@'%' IDENTIFIED BY '${pw}';
+        GRANT ALL PRIVILEGES ON *.* TO 'admin'@'%' WITH GRANT OPTION;
+        SET SESSION sql_log_bin = 1;
+        SQL
+      args:
+        executable: /bin/bash
+      environment:
+        ADMIN_PASSWORD: "{{ lookup('env', 'COLORS_PAR_MYSQL_ADMIN_PASSWORD') }}"
+      no_log: true
+      changed_when: true
+      register: admin_account
+      failed_when: false
+
+    # MySQL's own error text, which never echoes the password back.
+    - name: Report why it failed
+      ansible.builtin.fail:
+        msg: "{{ admin_account.stderr | default(admin_account.msg) | default('failed') }}"
+      when: admin_account is not skipped and (admin_account.rc | default(1)) != 0
+
+    # Only the credentials. The recovery channel accepts a restricted set of
+    # CHANGE REPLICATION SOURCE parameters — GET_SOURCE_PUBLIC_KEY is not one of
+    # them, and asking for it is ERROR 3139. The equivalent for this channel is
+    # the server variable `group_replication_recovery_get_public_key`, which
+    # z-colors-ha.cnf sets.
+    #
+    # Skipped on a member that is already in the group: the channel's threads
+    # are running, MySQL refuses to reconfigure it, and its credentials were set
+    # when it joined. Converging a healthy cluster must not fail.
+    - name: Point the distributed-recovery channel at the replication account
+      when: gr_online.stdout | trim == '0'
+      ansible.builtin.shell: |
+        set -euo pipefail
+        esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"; }
+        pw=$(esc "$REPL_PASSWORD")
+        mysql --protocol=socket --user=root <<SQL
+        CHANGE REPLICATION SOURCE TO
+          SOURCE_USER = 'repl',
+          SOURCE_PASSWORD = '${pw}'
+          FOR CHANNEL 'group_replication_recovery';
+        SQL
+      args:
+        executable: /bin/bash
+      environment:
+        # See "the 32-character channel limit" below.
+        REPL_PASSWORD: "{{ (lookup('env', 'COLORS_PAR_MYSQL_REPLICATION_PASSWORD') | hash('sha256'))[:32] }}"
+      no_log: true
+      changed_when: true
+      register: recovery_channel
+      failed_when: false
+
+    # MySQL's own error text, which never echoes the password back.
+    - name: Report why it failed
+      ansible.builtin.fail:
+        msg: "{{ recovery_channel.stderr | default(recovery_channel.msg) | default('failed') }}"
+      when: recovery_channel is not skipped and (recovery_channel.rc | default(1)) != 0
+
+- name: Bootstrap the group, but only if there is no group
+  hosts: bootstrap
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Add up what every member reported
+      ansible.builtin.set_fact:
+        cluster_online: >-
+          {{ groups['mysql']
+             | map('extract', hostvars, ['gr_online', 'stdout'])
+             | map('trim') | map('int') | sum }}
+
+    - name: Report the decision
+      ansible.builtin.debug:
+        msg: >-
+          {{ ((cluster_online | int) == 0)
+             | ternary('no member is ONLINE anywhere; bootstrapping',
+                       'the group already exists; joining it') }}
+
+    - name: Bootstrap
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mysql --protocol=socket --user=root <<'SQL'
+        SET GLOBAL group_replication_bootstrap_group = ON;
+        START GROUP_REPLICATION;
+        SET GLOBAL group_replication_bootstrap_group = OFF;
+        SQL
+      args:
+        executable: /bin/bash
+      when: cluster_online | int == 0
+      changed_when: true
+
+- name: Bring every member into the group, one at a time
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  serial: 1
+
+  tasks:
+    - name: What state is this member in
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT COALESCE((SELECT MEMBER_STATE
+                               FROM performance_schema.replication_group_members
+                              WHERE MEMBER_ID = @@server_uuid), 'OFFLINE')
+      register: member_state
+      changed_when: false
+
+    - name: Start group replication
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -e
+          - START GROUP_REPLICATION
+      register: start_gr
+      when: member_state.stdout | trim != 'ONLINE'
+      changed_when: start_gr.rc == 0
+      failed_when:
+        - start_gr.rc != 0
+        - "'already running' not in (start_gr.stderr | default(''))"
+
+    - name: Wait for this member to come ONLINE
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT COALESCE((SELECT MEMBER_STATE
+                               FROM performance_schema.replication_group_members
+                              WHERE MEMBER_ID = @@server_uuid), 'OFFLINE')
+      register: joined
+      until: joined.stdout | trim == 'ONLINE'
+      retries: 60
+      delay: 5
+      changed_when: false
+
+- name: Create the operational schema on whichever member is primary
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Which role does this member hold
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
+            WHERE MEMBER_ID = @@server_uuid
+      register: member_role
+      changed_when: false
+
+    # Two tables, because the health check and the restore check ask different
+    # questions. `heartbeat` answers "how stale is this copy"; `beat_log`
+    # answers "did the archived binary logs actually carry anything after the
+    # snapshot" — which is the assertion that makes the restore check a
+    # point-in-time check rather than a dump check.
+    - name: Create the heartbeat schema
+      ansible.builtin.shell: |
+        set -euo pipefail
+        mysql --protocol=socket --user=root <<'SQL'
+        CREATE DATABASE IF NOT EXISTS mysql_ha;
+        CREATE TABLE IF NOT EXISTS mysql_ha.heartbeat (
+          id   TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+          ts   DATETIME(6)      NOT NULL,
+          node VARCHAR(64)      NOT NULL
+        ) ENGINE = InnoDB;
+        CREATE TABLE IF NOT EXISTS mysql_ha.beat_log (
+          id   BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          ts   DATETIME(6)      NOT NULL,
+          node VARCHAR(64)      NOT NULL,
+          KEY beat_log_ts (ts)
+        ) ENGINE = InnoDB;
+        INSERT IGNORE INTO mysql_ha.heartbeat (id, ts, node)
+          VALUES (1, NOW(6), 'bootstrap');
+        SQL
+      args:
+        executable: /bin/bash
+      when: member_role.stdout | trim == 'PRIMARY'
+      changed_when: true
+
+- name: Let a rebooted member rejoin by itself
+  hosts: mysql
+  become: true
+  gather_facts: false
+
+  tasks:
+    # Deliberately notifies nothing. It takes effect at the next start, which
+    # is exactly when it is needed, and restarting the server to install it
+    # would cause the outage it exists to shorten.
+    - name: Enable start-on-boot now that the group exists
+      ansible.builtin.copy:
+        dest: /etc/mysql/mysql.conf.d/zz-colors-ha-boot.cnf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Colors mysql-ha.
+          #
+          # Split out of z-colors-ha.cnf so that turning it on never triggers a
+          # restart handler. Bootstrapping stays an explicit act of the cluster
+          # playbook; this only lets a member that already belongs to the group
+          # rejoin it after a reboot.
+          [mysqld]
+          group_replication_start_on_boot = ON
+
+- name: Confirm the whole group is up
+  hosts: bootstrap
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  tasks:
+    - name: Every member ONLINE
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT COUNT(*) FROM performance_schema.replication_group_members
+            WHERE MEMBER_STATE = 'ONLINE'
+      register: group_size
+      until: group_size.stdout | trim == '3'
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    - name: Exactly one primary
+      ansible.builtin.command:
+        argv:
+          - mysql
+          - --protocol=socket
+          - --user=root
+          - -N
+          - -B
+          - -e
+          - >-
+            SELECT COUNT(*) FROM performance_schema.replication_group_members
+            WHERE MEMBER_STATE = 'ONLINE' AND MEMBER_ROLE = 'PRIMARY'
+      register: primary_count
+      until: primary_count.stdout | trim == '1'
+      retries: 30
+      delay: 5
+      changed_when: false

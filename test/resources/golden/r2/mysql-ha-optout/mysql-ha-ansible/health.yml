@@ -1,0 +1,41 @@
+---
+# Assert the live cluster. Deliberately self-contained: it reinstalls the
+# helper library and the check script before running them, so `./green health`
+# works on a cluster whose agents predate the currently checked-out package.
+- name: Assert the live cluster from every member
+  hosts: mysql
+  become: true
+  gather_facts: false
+  any_errors_fatal: false
+
+  tasks:
+    - name: Refresh the shared helper library
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/mysql-ha-lib"
+        dest: /usr/local/lib/mysql-ha-lib
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Refresh the health check
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/mysql-ha-health"
+        dest: /usr/local/bin/mysql-ha-health
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Run every check
+      ansible.builtin.command: /usr/local/bin/mysql-ha-health
+      register: health
+      changed_when: false
+      failed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ health.stdout_lines }}"
+
+    - name: Fail if any check failed
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} failed one or more health checks"
+      when: health.rc != 0

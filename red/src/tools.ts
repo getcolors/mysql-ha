@@ -21,9 +21,14 @@ import { runtime } from "red/runtime";
 import type { Opts } from "red/workflow";
 import { StepError, failed } from "red/workflow";
 import { compute, computeCluster } from "package-once-red";
+import * as ssh from "./ssh.ts";
+import * as sshConfig from "./ssh-config.ts";
 import * as utils from "./utils.ts";
 import * as validate from "./validate.ts";
 
+import ansibleLocalCfg from "../resources/tools/ansible-local/ansible.cfg" with { type: "text" };
+import ansibleLocalInventory from "../resources/tools/ansible-local/inventory.ini" with { type: "text" };
+import ansibleLocalMain from "../resources/tools/ansible-local/main.yml" with { type: "text" };
 import ansibleCfg from "../resources/tools/ansible/ansible.cfg" with { type: "text" };
 import ansibleBackup from "../resources/tools/ansible/backup.yml" with { type: "text" };
 import ansibleBase from "../resources/tools/ansible/base.yml" with { type: "text" };
@@ -47,6 +52,7 @@ import infrastructureMainTf from "../resources/tools/infrastructure/main.tf" wit
 
 export const infrastructureTool = "mysql-ha-infrastructure";
 export const dnsTool = "mysql-ha-dns";
+export const ansibleLocalTool = "mysql-ha-ansible-local";
 export const ansibleTool = "mysql-ha-ansible";
 export const tofuTools = [infrastructureTool, dnsTool];
 
@@ -55,6 +61,9 @@ const templateOpts = PRESERVE_JINJA_DELIMITERS;
 // The template tree this colour carries, keyed the way green names its
 // classpath resources: "<path>/<file>" with dots as directories.
 const templates: Record<string, string> = {
+  "ansible-local/ansible.cfg": ansibleLocalCfg,
+  "ansible-local/inventory.ini": ansibleLocalInventory,
+  "ansible-local/main.yml": ansibleLocalMain,
   "ansible/ansible.cfg": ansibleCfg,
   "ansible/backup.yml": ansibleBackup,
   "ansible/base.yml": ansibleBase,
@@ -131,6 +140,10 @@ export const fallbackOutputs: Opts = {
 const fallbackDropletId = (ordinal: number): number => 100000000 + ordinal;
 
 export function infrastructureSpecs(opts: Opts): Spec[] {
+  // The machine-key paths are filled here as well as in preflight, so the
+  // template renders the same bytes whichever step scaffolds it — the state
+  // reader renders it as a build, and a test may render it alone.
+  opts = ssh.withMachineKey(opts);
   const dir = toolDir(opts, infrastructureTool);
   const data: Opts = {
     ...opts,
@@ -345,10 +358,20 @@ export function groupSeeds(opts: Opts): string {
     .join(",");
 }
 
+// The private key every play reaches the members with: the generated key's
+// path in keygen mode (the build placeholder on a build or a dry-run), the
+// operator's `digitalocean-ssh-private-key` in opt-out mode.
+export function privateKeyFile(data: Opts): string {
+  return validate.keygen(data)
+    ? String(data["ssh-private-key-path"])
+    : String(data["digitalocean-ssh-private-key"]);
+}
+
 // Template data: desired state over the fallback cluster facts, with the
 // adopted cluster's `reserved_ip`, `vpc_id` and `vpc_ip_range` winning on a
-// real run.
+// real run, and the machine-key paths keygen mode owns.
 export function dataFn(opts: Opts): Opts {
+  opts = ssh.withMachineKey(opts);
   const recorded = (opts["once/cluster"] ?? {}) as Opts;
   const facts = Object.fromEntries(
     Object.keys(fallbackOutputs).filter((k) => k in recorded).map((k) => [k, recorded[k]]));
@@ -412,7 +435,7 @@ function pretty(value: unknown, indent = 0): string {
 // group — it carries no meaning once the group exists.
 export function inventory(opts: Opts): string {
   const data = dataFn(opts);
-  const keyFile = String(data["digitalocean-ssh-private-key"]);
+  const keyFile = privateKeyFile(data);
   const members = nodes(data);
   const hosts: Record<string, Opts> = Object.fromEntries(
     members
@@ -443,6 +466,58 @@ export function inventory(opts: Opts): string {
       },
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// ssh config (local)
+
+// Only what a `build` genuinely knows. Addresses are run-time facts and reach
+// the play as extra-vars instead, so the rendered playbook carries no IP and is
+// identical on every workstation (SSH Config Standard §6).
+export function ansibleLocalData(opts: Opts): Opts {
+  return {
+    ...opts,
+    "ssh-keygen": validate.keygen(opts),
+    "ssh-config-identity-file": sshConfig.identityFile(opts),
+    "host-alias": sshConfig.hostAlias(opts),
+  };
+}
+
+export function ansibleLocalSpecs(opts: Opts): Spec[] {
+  const dir = toolDir(opts, ansibleLocalTool);
+  const data = ansibleLocalData(opts);
+  return [
+    spec(template("ansible-local", "ansible.cfg"), `${dir}/ansible.cfg`, data),
+    spec(template("ansible-local", "inventory.ini"), `${dir}/inventory.ini`, data),
+    spec(template("ansible-local", "main.yml"), `${dir}/main.yml`, data),
+  ];
+}
+
+// The `~/.ssh/config` entries, as data the play loops over: the bare profile
+// pointing at node 0 (the spec's entry), then one alias per member. ONCE's
+// (Compute Cluster Standard §6).
+export function sshConfigHosts(opts: Opts): computeCluster.SshConfigHost[] {
+  return computeCluster.sshConfigHosts(validate.spec, opts, clusterNodes(opts));
+}
+
+// Write or remove the `~/.ssh/config` block. The same playbook serves both
+// events; `block_state` is what distinguishes them. Skipped on a delete whose
+// state records no cluster: there is no block to withdraw.
+export async function ansibleLocalStep(opts: Opts): Promise<Opts> {
+  const isDelete = opts["red/event"] === "delete";
+  if (isDelete && opts["mysql-ha/infrastructure-present?"] === false) {
+    return { ...opts, "red/exit": 0 };
+  }
+  return ansible.ansibleWithSpec(opts, {
+    dir: toolDir(opts, ansibleLocalTool),
+    inventory: "inventory.ini",
+    playbooks: { create: "main.yml", delete: "main.yml" },
+    extraVars: {
+      host_alias: sshConfig.hostAlias(opts),
+      ssh_hosts: sshConfigHosts(opts),
+      block_state: isDelete ? "absent" : "present",
+    },
+  }, ansibleLocalSpecs(opts));
 }
 
 // ---------------------------------------------------------------------------

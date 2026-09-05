@@ -36,8 +36,8 @@ exits 2.
 | `digitalocean-region` | e.g. `ams3` |
 | `digitalocean-size` | e.g. `s-2vcpu-4gb` |
 | `digitalocean-image` | e.g. `ubuntu-24-04-x64` |
-| `digitalocean-ssh-keys` | an SSH key **already registered** on the account, by ID or fingerprint. Nothing is uploaded. |
-| `digitalocean-ssh-private-key` | the matching private key on this machine, used by Ansible |
+| `digitalocean-ssh-keys` | **optional** — leave it out and the deployment owns its keypair: `create` generates `~/.ssh/<profile>`, registers its public half at DigitalOcean under the profile's name, and `delete` removes both last (the workspace SSH Keypair Standard). Supply an SSH key **already registered** on the account, by ID or fingerprint, to opt out; nothing is then generated or uploaded. |
+| `digitalocean-ssh-private-key` | opt-out mode only: the private half of `digitalocean-ssh-keys` on this machine, used by Ansible. Refused as a requirement in keygen mode, where the generated key is used. |
 | `digitalocean-ssh-sources` | list of CIDRs allowed to SSH |
 | `digitalocean-client-sources` | list of CIDRs allowed to reach the MySQL port |
 | `digitalocean-vpc-mode` | must be `default`. The region's default VPC is discovered at run time; there is no VPC UUID, no VPC CIDR and no VPC resource in desired state. |

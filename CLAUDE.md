@@ -37,15 +37,20 @@ cd green && ./green create --dry-run
 cd green && ./green health     # read-only assertions against the live cluster
 ```
 
-The goldens have a second axis beside the fixture: the one
-`test/fixtures/colors.yml` is rendered under the **local** state backend and
-again under **r2** (`COLORS_PAR_PROVIDER_BACKEND=r2` overlaid on the same
-file). The committed trees live at
-`test/resources/golden/{local,r2}/mysql-ha-fixture/` and differ only in each
-OpenTofu stage's `backend.tf.json`. `scripts/golden.sh` checks green against
-both; `scripts/parity.sh` renders both variants through every colour and
-diffs the trees — and the colour template trees (`red/resources`, blue's
-embedded `resources/`) — byte for byte.
+The goldens have two axes. `test/fixtures/colors.yml` is the keygen-mode
+fixture (no `digitalocean-ssh-keys`: the package owns the keypair) and
+`test/fixtures/optout.yml` is the opt-out fixture (an explicit key id: the
+package touches no key material and renders byte-for-byte what it rendered
+before the SSH Keypair Standard, under its own profile). Each is rendered
+under the **local** state backend and again under **r2**
+(`COLORS_PAR_PROVIDER_BACKEND=r2` overlaid on the same file). The four
+committed trees live at
+`test/resources/golden/{local,r2}/mysql-ha-{fixture,optout}/`; the backend
+pair differs only in each OpenTofu stage's `backend.tf.json`.
+`scripts/golden.sh` checks green against all four; `scripts/parity.sh`
+renders all four through every colour and diffs the trees — and the colour
+template trees (`red/resources`, blue's embedded `resources/`) — byte for
+byte.
 
 Never run a real `create`/`delete` without explicit authorization. Never edit or
 read `.colors/`, and never read `.envrc.private`. Real deletion requires
@@ -56,10 +61,25 @@ committed flag.
 
 The package pins the SDK — Green in `green/deps.edn`, the Red SDK in
 `red/package.json`, the Blue SDK in `blue/pyproject.toml` — and ONCE, in the
-same three manifests, for one namespace: `compute-cluster`
-(`io.github.getcolors.once.compute-cluster`, `package-once-red`'s
-`computeCluster`, `package_once_blue.compute_cluster`), the one implementation
-of the Compute Cluster Standard (`workspace/standards/compute-cluster.md`).
+same three manifests and in the red payload's `PINS`, for two namespaces:
+`compute-cluster` (`io.github.getcolors.once.compute-cluster`,
+`package-once-red`'s `computeCluster`, `package_once_blue.compute_cluster`),
+the one implementation of the Compute Cluster Standard
+(`workspace/standards/compute-cluster.md`), and `ssh`
+(`io.github.getcolors.once.ssh`, ONCE's unexported `red/src/ssh.ts` reached
+through `red/src/once.ts`, `package_once_blue.ssh`), the reference
+implementation of the SSH Keypair Standard (`workspace/standards/ssh-keypair.md`).
+The package's `ssh` module wraps ONCE's with the build placeholder; its
+`ssh_config` module and its `ansible-local` play are its own copies of the
+multi-node shape every DB package carries (`workspace/standards/ssh-config.md`
+§7; `workspace/scripts/package-copies.py` gates the copies), writing one
+`~/.ssh/config` block marked with the profile that holds a stanza per alias
+(`<profile>`, `<profile>-0..2`). Keygen mode is the absence of
+`digitalocean-ssh-keys`; `digitalocean-ssh-private-key` is required in opt-out
+mode only. On a real create the keypair matrix and the DigitalOcean key
+preflight run in `start-step` before anything renders; the block is written
+after the infrastructure stage and withdrawn before the destroy; the keypair
+is removed last, after the destroy.
 The package owns its `compute-providers` registry, its `spec` (one
 homogeneous role of `cluster-nodes` members, fallback offset 11, the
 `10.110.0.0/20` fallback subnet, a discovered network), its own validators

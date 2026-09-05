@@ -12,6 +12,9 @@
 (def fixture
   (green-cli/read-state "colors.yml" (slurp "test/fixtures/colors.yml")))
 
+(def optout
+  (green-cli/read-state "optout.yml" (slurp "test/fixtures/optout.yml")))
+
 (def legacy-outputs
   "A pre-adoption state exactly as `tofu output -json` parsed it: the six
   outputs, three parallel lists among them, and no `params`."
@@ -186,9 +189,32 @@
     (testing "bootstrap is only ever member one, and only for an empty group"
       (is (= (get-in children [:mysql :hosts :fixture-node-1])
              (get-in children [:bootstrap :hosts :fixture-node-1]))))
-    (is (= "~/.ssh/id_ed25519"
-           (get-in children [:mysql :hosts :fixture-node-2
-                             :ansible_ssh_private_key_file])))))
+    (testing "the members are reached with the generated key in keygen mode, on a build through the placeholder"
+      (is (= "/home/build-placeholder/.ssh/mysql-ha-fixture"
+             (get-in (json/parse-string (tools/inventory (assoc fixture :green/event :build)) true)
+                     [:all :children :mysql :hosts :fixture-node-2 :ansible_ssh_private_key_file]))))
+    (testing "and with the operator's own key in opt-out mode"
+      (is (= "~/.ssh/id_ed25519"
+             (get-in (json/parse-string (tools/inventory optout) true)
+                     [:all :children :mysql :hosts :fixture-node-2 :ansible_ssh_private_key_file]))))))
+
+(deftest the-local-stage-writes-one-block-per-alias-and-carries-no-address
+  (let [data (:data (first (tools/ansible-local-specs fixture)))]
+    (is (true? (:ssh-keygen data)))
+    (is (= "~/.ssh/mysql-ha-fixture" (:ssh-config-identity-file data)))
+    (is (= "mysql-ha-fixture" (:host-alias data)))
+    (is (not (contains? data :ssh_hosts)) "addresses travel as extra-vars, never through Selmer"))
+  (is (false? (:ssh-keygen (:data (first (tools/ansible-local-specs optout))))))
+  (testing "the bare alias points at member one, then one alias per member"
+    (is (= [{:name "mysql-ha-fixture" :ip "192.0.2.11"}
+            {:name "mysql-ha-fixture-0" :ip "192.0.2.11"}
+            {:name "mysql-ha-fixture-1" :ip "192.0.2.12"}
+            {:name "mysql-ha-fixture-2" :ip "192.0.2.13"}]
+           (tools/ssh-config-hosts fixture))))
+  (testing "a delete whose state records no cluster has no block to withdraw"
+    (is (= 0 (:green/exit (tools/ansible-local-step
+                           (assoc fixture :green/event :delete
+                                  :mysql-ha/infrastructure-present? false)))))))
 
 (deftest the-inventory-is-byte-stable
   (is (= (tools/inventory fixture) (tools/inventory fixture))))

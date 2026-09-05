@@ -43,6 +43,13 @@ MySQL 8.0 in single-primary Group Replication, plus six systemd units — the
 endpoint claimer, the heartbeat, the binary-log archiver, its uploader, the
 snapshot job, and the verified restore.
 
+The deployment owns its SSH keypair (keygen mode: leave `digitalocean-ssh-keys`
+out of `colors.yml`; the first real `create` generates `~/.ssh/<profile>` and
+registers it at DigitalOcean, and `delete` removes it last) and writes one
+`~/.ssh/config` block so that `ssh <profile>`, `ssh <profile>-0`, `-1` and
+`-2` reach the members. Supplying `digitalocean-ssh-keys` and
+`digitalocean-ssh-private-key` opts out and uses your own key untouched.
+
 ## How failover works
 
 Group Replication elects the new primary. Separately, a ten-second timer on each

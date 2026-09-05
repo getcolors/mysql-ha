@@ -21,6 +21,7 @@ import { parName } from "red/cli";
 import * as providerOps from "red/providers";
 import type { Opts } from "red/workflow";
 import { compute, computeCluster } from "package-once-red";
+import { onceSsh } from "./once.ts";
 import * as utils from "./utils.ts";
 
 // provider-compute -> what that choice implies.
@@ -30,13 +31,14 @@ import * as utils from "./utils.ts";
 // natively from the process environment, so a credential never has to be
 // rendered into a .tf file sitting in the work directory in plaintext.
 // `network` is discovered: the region's default VPC, never one this package
-// owns. `digitalocean-ssh-keys` stays a required literal key; the SSH Keypair
-// Standard is a separate adoption.
+// owns. `digitalocean-ssh-keys` is deliberately absent from `required`: per the
+// SSH Keypair Standard its absence selects keygen mode, and its presence is the
+// opt-out that passes the operator's key ids through untouched.
 export const computeProviders: computeCluster.ClusterRegistry = {
   digitalocean: {
     required: ["digitalocean-name", "digitalocean-region",
                "digitalocean-size", "digitalocean-image",
-               "digitalocean-ssh-keys", "digitalocean-vpc-mode"],
+               "digitalocean-vpc-mode"],
     secrets: ["do-token"],
     tofuEnv: { "do-token": "DIGITALOCEAN_TOKEN" },
     network: { mode: "discovered" },
@@ -97,8 +99,7 @@ export const ownSlots = ["provider-dns", "provider-backend"];
 export const ownRequired = [
   "profile", "workdir",
   "cluster-host", "cluster-nodes",
-  "digitalocean-ssh-private-key", "digitalocean-ssh-sources",
-  "digitalocean-client-sources",
+  "digitalocean-ssh-sources", "digitalocean-client-sources",
   "cloudflare-proxied",
   "mysql-port", "mysql-group-port", "mysql-group-name",
   "mysql-admin-user", "mysql-replication-user",
@@ -120,6 +121,13 @@ export const ownSecrets = [
 ];
 
 export const placeholder = (x: unknown) => providerOps.placeholder(x);
+
+// Whether this deployment owns its machine keypair: `digitalocean-ssh-keys` is
+// absent. Delegates to ONCE, the standard's reference implementation, so one
+// rule decides it everywhere.
+export function keygen(opts: Opts): boolean {
+  return onceSsh.keygen(opts);
+}
 
 export const profilePar = parName("profile");
 
@@ -189,6 +197,12 @@ export function stateErrors(opts: Opts): string[] {
   if (!(placeholder(opts["cluster-host"]) || placeholder(opts["cloudflare-zone"])
         || String(opts["cluster-host"]).endsWith(`.${opts["cloudflare-zone"]}`))) {
     errors.push(":cluster-host must sit inside :cloudflare-zone");
+  }
+  // Opt-out mode reaches the members with the operator's own key, so the path
+  // to it is desired state there; keygen mode names the generated key itself
+  // and must not be asked for one.
+  if (!keygen(opts) && placeholder(opts["digitalocean-ssh-private-key"])) {
+    errors.push(":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied");
   }
   if (opts["cluster-nodes"] !== 3) {
     errors.push(":cluster-nodes must be 3; a Group Replication majority needs an odd group and the budget is three droplets");

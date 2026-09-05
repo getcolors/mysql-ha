@@ -27,6 +27,7 @@ from blue import providers as provider_ops
 from blue.cli import par_name
 from package_once_blue import compute as once_compute
 from package_once_blue import compute_cluster as cluster
+from package_once_blue import ssh as once_ssh
 
 from . import utils
 
@@ -37,13 +38,14 @@ from . import utils
 # natively from the process environment, so a credential never has to be
 # rendered into a .tf file sitting in the work directory in plaintext.
 # `network` is discovered: the region's default VPC, never one this package
-# owns. `digitalocean-ssh-keys` stays a required literal key; the SSH Keypair
-# Standard is a separate adoption.
+# owns. `digitalocean-ssh-keys` is deliberately absent from `required`: per the
+# SSH Keypair Standard its absence selects keygen mode, and its presence is the
+# opt-out that passes the operator's key ids through untouched.
 compute_providers = {
     "digitalocean": {
         "required": ["digitalocean-name", "digitalocean-region",
                      "digitalocean-size", "digitalocean-image",
-                     "digitalocean-ssh-keys", "digitalocean-vpc-mode"],
+                     "digitalocean-vpc-mode"],
         "secrets": ["do-token"],
         "tofu-env": {"do-token": "DIGITALOCEAN_TOKEN"},
         "network": {"mode": "discovered"},
@@ -104,8 +106,7 @@ own_slots = ["provider-dns", "provider-backend"]
 own_required = [
     "profile", "workdir",
     "cluster-host", "cluster-nodes",
-    "digitalocean-ssh-private-key", "digitalocean-ssh-sources",
-    "digitalocean-client-sources",
+    "digitalocean-ssh-sources", "digitalocean-client-sources",
     "cloudflare-proxied",
     "mysql-port", "mysql-group-port", "mysql-group-name",
     "mysql-admin-user", "mysql-replication-user",
@@ -129,6 +130,13 @@ own_secrets = [
 
 def placeholder(x) -> bool:
     return provider_ops.placeholder(x)
+
+
+def keygen(opts: dict) -> bool:
+    """Whether this deployment owns its machine keypair: `digitalocean-ssh-keys`
+    is absent. Delegates to ONCE, the standard's reference implementation, so
+    one rule decides it everywhere."""
+    return once_ssh.keygen(opts)
 
 
 profile_par = par_name("profile")
@@ -199,6 +207,11 @@ def state_errors(opts: dict) -> list[str]:
             or placeholder(opts.get("cloudflare-zone"))
             or str(opts.get("cluster-host")).endswith(f".{opts.get('cloudflare-zone')}")):
         errors.append(":cluster-host must sit inside :cloudflare-zone")
+    # Opt-out mode reaches the members with the operator's own key, so the
+    # path to it is desired state there; keygen mode names the generated key
+    # itself and must not be asked for one.
+    if not keygen(opts) and placeholder(opts.get("digitalocean-ssh-private-key")):
+        errors.append(":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied")
     if opts.get("cluster-nodes") != 3:
         errors.append(":cluster-nodes must be 3; a Group Replication majority needs an odd group and the budget is three droplets")
     if opts.get("digitalocean-vpc-mode") != "default":

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StepError, type Opts } from "red/workflow";
 import { computeCluster } from "package-once-red";
+import * as ssh from "../src/ssh.ts";
+import * as sshConfig from "../src/ssh-config.ts";
 import * as tools from "../src/tools.ts";
 import * as utils from "../src/utils.ts";
 import * as validate from "../src/validate.ts";
@@ -11,11 +13,15 @@ import * as workflow from "../src/workflow.ts";
 import { run } from "../src/cli.ts";
 
 const fixtureFile = join(import.meta.dir, "../../test/fixtures/colors.yml");
+const optoutFile = join(import.meta.dir, "../../test/fixtures/optout.yml");
 
-function fixture(overrides: Opts = {}): Opts {
-  const text = readFileSync(fixtureFile, "utf8");
+function readFixture(path: string, overrides: Opts): Opts {
+  const text = readFileSync(path, "utf8");
   return { ...(Bun.YAML.parse(text) as Opts), ...overrides };
 }
+
+const fixture = (overrides: Opts = {}) => readFixture(fixtureFile, overrides);
+const optout = (overrides: Opts = {}) => readFixture(optoutFile, overrides);
 
 // A pre-adoption state exactly as `tofu output -json` parsed it: the six
 // outputs, three parallel lists among them, and no `params`.
@@ -215,8 +221,38 @@ describe("tools", () => {
     // Bootstrap is only ever member one, and only for an empty group.
     expect(children.bootstrap.hosts["fixture-node-1"])
       .toEqual(children.mysql.hosts["fixture-node-1"]);
-    expect(children.mysql.hosts["fixture-node-2"].ansible_ssh_private_key_file)
+    // The members are reached with the generated key in keygen mode, on a
+    // build through the placeholder, and with the operator's own key in
+    // opt-out mode.
+    const built = JSON.parse(tools.inventory(fixture({ "red/event": "build" })));
+    expect(built.all.children.mysql.hosts["fixture-node-2"].ansible_ssh_private_key_file)
+      .toBe("/home/build-placeholder/.ssh/mysql-ha-fixture");
+    const optedOut = JSON.parse(tools.inventory(optout()));
+    expect(optedOut.all.children.mysql.hosts["fixture-node-2"].ansible_ssh_private_key_file)
       .toBe("~/.ssh/id_ed25519");
+  });
+
+  test("the local stage writes one block per alias and carries no address", () => {
+    const data = tools.ansibleLocalSpecs(fixture())[0]!.data as Opts;
+    expect(data["ssh-keygen"]).toBe(true);
+    expect(data["ssh-config-identity-file"]).toBe("~/.ssh/mysql-ha-fixture");
+    expect(data["host-alias"]).toBe("mysql-ha-fixture");
+    // Addresses travel as extra-vars, never through Selmer.
+    expect("ssh_hosts" in data).toBe(false);
+    expect((tools.ansibleLocalSpecs(optout())[0]!.data as Opts)["ssh-keygen"]).toBe(false);
+    // The bare alias points at member one, then one alias per member.
+    expect(tools.sshConfigHosts(fixture())).toEqual([
+      { name: "mysql-ha-fixture", ip: "192.0.2.11" },
+      { name: "mysql-ha-fixture-0", ip: "192.0.2.11" },
+      { name: "mysql-ha-fixture-1", ip: "192.0.2.12" },
+      { name: "mysql-ha-fixture-2", ip: "192.0.2.13" },
+    ]);
+  });
+
+  test("a delete whose state records no cluster has no block to withdraw", async () => {
+    const r = await tools.ansibleLocalStep(
+      fixture({ "red/event": "delete", "mysql-ha/infrastructure-present?": false }));
+    expect(r["red/exit"]).toBe(0);
   });
 
   test("the inventory is byte-stable", () => {
@@ -280,6 +316,25 @@ describe("tools", () => {
 describe("validate", () => {
   test("the fixture is renderable", () => {
     expect(validate.stateErrors(fixture())).toEqual([]);
+  });
+
+  test("both keypair modes are renderable", () => {
+    // The SSH Keypair Standard has two modes and conformance means both hold.
+    expect(validate.stateErrors(optout())).toEqual([]);
+    expect(validate.keygen(fixture())).toBe(true);
+    expect(validate.keygen(optout())).toBe(false);
+  });
+
+  test("the machine key is never required", () => {
+    // Its absence is keygen mode, not a missing key.
+    expect(validate.stateErrors(fixture()).some((e) => e.includes("digitalocean-ssh-keys"))).toBe(false);
+  });
+
+  test("the private key path is desired state in opt-out mode only", () => {
+    expect(validate.stateErrors(without(optout(), "digitalocean-ssh-private-key") as Opts))
+      .toContain(":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied");
+    // Keygen mode names the generated key itself and asks for no path.
+    expect(validate.stateErrors(without(fixture(), "digitalocean-ssh-private-key") as Opts)).toEqual([]);
   });
 
   test("every required key is required", () => {
@@ -475,9 +530,13 @@ const nexts = (step: string, runOpts: Opts): string[] =>
   (workflow.wireFn(step, runOpts) ?? []).slice(1).map(String);
 
 describe("workflow", () => {
-  test("create forks at the infrastructure and joins at the cluster", () => {
+  test("create forks after the local ssh config and joins at the cluster", () => {
     expect(nexts("mysql-ha/start", create)).toEqual(["mysql-ha/infrastructure"]);
-    expect(nexts("mysql-ha/infrastructure", create)).toEqual(["mysql-ha/dns", "mysql-ha/base"]);
+    // The block is written after compute, where the addresses first exist,
+    // and before any member is converged.
+    expect(nexts("mysql-ha/infrastructure", create)).toEqual(["mysql-ha/ansible-local"]);
+    expect(workflow.wireFn("mysql-ha/ansible-local", create)?.[0]).toBe(tools.ansibleLocalStep);
+    expect(nexts("mysql-ha/ansible-local", create)).toEqual(["mysql-ha/dns", "mysql-ha/base"]);
     // Both branches converge on one step, so the engine joins them once.
     expect(nexts("mysql-ha/dns", create)).toEqual(["mysql-ha/cluster"]);
     expect(nexts("mysql-ha/base", create)).toEqual(["mysql-ha/cluster"]);
@@ -487,8 +546,8 @@ describe("workflow", () => {
   });
 
   test("build walks the same graph as create", () => {
-    for (const step of ["mysql-ha/start", "mysql-ha/infrastructure", "mysql-ha/dns",
-                        "mysql-ha/base", "mysql-ha/cluster", "mysql-ha/backup"]) {
+    for (const step of ["mysql-ha/start", "mysql-ha/infrastructure", "mysql-ha/ansible-local",
+                        "mysql-ha/dns", "mysql-ha/base", "mysql-ha/cluster", "mysql-ha/backup"]) {
       expect(nexts(step, build)).toEqual(nexts(step, create));
     }
   });
@@ -496,9 +555,29 @@ describe("workflow", () => {
   test("delete reads state first and destroys in reverse", () => {
     expect(nexts("mysql-ha/start", del)).toEqual(["mysql-ha/load-infrastructure"]);
     expect(nexts("mysql-ha/load-infrastructure", del)).toEqual(["mysql-ha/cleanup"]);
-    expect(nexts("mysql-ha/cleanup", del)).toEqual(["mysql-ha/dns"]);
+    // The ssh config block goes before the destroy, the keypair after it
+    // (ssh-config.md §4).
+    expect(nexts("mysql-ha/cleanup", del)).toEqual(["mysql-ha/ansible-local"]);
+    expect(nexts("mysql-ha/ansible-local", del)).toEqual(["mysql-ha/dns"]);
     expect(nexts("mysql-ha/dns", del)).toEqual(["mysql-ha/infrastructure"]);
-    expect(nexts("mysql-ha/infrastructure", del)).toEqual([]);
+    expect(nexts("mysql-ha/infrastructure", del)).toEqual(["mysql-ha/ssh-cleanup"]);
+    expect(workflow.wireFn("mysql-ha/ssh-cleanup", del)?.[0]).toBe(ssh.cleanupStep);
+    expect(nexts("mysql-ha/ssh-cleanup", del)).toEqual([]);
+  });
+
+  test("a build fills the placeholder key paths", async () => {
+    // Every event fills the machine-key paths in preflight so the templates
+    // and the inventory render the same whichever step scaffolds them; a build
+    // gets the fixed placeholder, never the operator's home.
+    const r = await workflow.startStep(fixture({ "red/event": "build" }), {});
+    expect(r["red/exit"]).toBe(0);
+    expect(r["ssh-private-key-path"]).toBe("/home/build-placeholder/.ssh/mysql-ha-fixture");
+    expect(r["ssh-keygen"]).toBe(true);
+    // Opt-out invents no key path.
+    const o = await workflow.startStep(optout({ "red/event": "build" }), {});
+    expect(o["red/exit"]).toBe(0);
+    expect(o["ssh-private-key-path"]).toBeUndefined();
+    expect(o["ssh-keygen"]).toBeUndefined();
   });
 
   test("health changes nothing", () => {
@@ -690,7 +769,7 @@ describe("workflow", () => {
     const result = await run("build", "-f", fixtureFile);
     expect(result["red/exit"]).toBe(0);
     const root = join(import.meta.dir, "../../test/fixtures/.colors/mysql-ha-fixture");
-    for (const stage of ["mysql-ha-infrastructure", "mysql-ha-dns", "mysql-ha-ansible"]) {
+    for (const stage of ["mysql-ha-infrastructure", "mysql-ha-ansible-local", "mysql-ha-dns", "mysql-ha-ansible"]) {
       expect(statSync(join(root, stage)).isDirectory()).toBe(true);
     }
     // The backend is written by advice, before the stage runs.
@@ -704,5 +783,120 @@ describe("workflow", () => {
       expect(readFileSync(file, "utf8"))
         .not.toMatch(/REPLACE_ME|BEGIN [A-Z ]*PRIVATE KEY/);
     }
+  });
+});
+
+// --- the machine keypair -----------------------------------------------------
+
+describe("ssh", () => {
+  test("a build never names the operator's home", () => {
+    // Committed goldens must mean the same thing on every workstation, so a
+    // build renders a fixed placeholder rather than reading ~/.ssh.
+    const opts = ssh.withMachineKey(fixture({ "red/event": "build" }));
+    expect(opts["ssh-private-key-path"]).toBe("/home/build-placeholder/.ssh/mysql-ha-fixture");
+    expect(opts["ssh-public-key-path"]).toBe("/home/build-placeholder/.ssh/mysql-ha-fixture.pub");
+    // The placeholder lands on the provider's own machine-key key.
+    expect(opts["digitalocean-ssh-keys"]).toBe("/home/build-placeholder/.ssh/mysql-ha-fixture.pub");
+    expect(String(process.env.HOME)).not.toContain("build-placeholder");
+  });
+
+  test("a dry-run is held to the same rule as a build", () => {
+    // A dry-run is a create that touches nothing; testing the event alone would
+    // let it reach the real key path.
+    expect(ssh.renderedOnly({ "red/event": "build" })).toBe(true);
+    expect(ssh.renderedOnly({ "red/event": "create", "red/dry-run": true })).toBe(true);
+    expect(ssh.renderedOnly({ "red/event": "create" })).toBe(false);
+    expect(ssh.withMachineKey(fixture({ "red/event": "create", "red/dry-run": true }))["ssh-private-key-path"])
+      .toBe("/home/build-placeholder/.ssh/mysql-ha-fixture");
+  });
+
+  test("real events render the real path", () => {
+    const opts = ssh.withMachineKey(fixture({ "red/event": "health" }));
+    expect(String(opts["ssh-private-key-path"])).not.toContain("build-placeholder");
+    expect(String(opts["ssh-private-key-path"]).endsWith("/.ssh/mysql-ha-fixture")).toBe(true);
+  });
+
+  test("opt-out opts pass through untouched", () => {
+    const opts = optout({ "red/event": "build" });
+    expect(ssh.withMachineKey(opts)).toEqual(opts);
+    expect(ssh.withMachineKey(opts)["ssh-private-key-path"]).toBeUndefined();
+  });
+});
+
+// --- ~/.ssh/config -----------------------------------------------------------
+
+describe("ssh-config", () => {
+  const opts = fixture({ profile: "mysql-ha-digitalocean" });
+
+  test("the deployment claims one alias per member and the bare profile", () => {
+    // `ssh mysql-ha-digitalocean` is what the standard promises; the numbered
+    // aliases are what make a group operable, since half of running one is
+    // reaching a specific member.
+    expect(sshConfig.aliases(opts)).toEqual(
+      ["mysql-ha-digitalocean", "mysql-ha-digitalocean-0", "mysql-ha-digitalocean-1", "mysql-ha-digitalocean-2"]);
+  });
+
+  test("the identity file stays unexpanded", () => {
+    expect(sshConfig.identityFile(opts)).toBe("~/.ssh/mysql-ha-digitalocean");
+  });
+
+  test("a foreign stanza is found for any alias, not just the first", () => {
+    const lines = "Host something\n  HostName 1.2.3.4\n\nHost mysql-ha-digitalocean-2\n  HostName 5.6.7.8\n"
+      .split("\n");
+    expect(sshConfig.foreignStanzaLine(lines, "mysql-ha-digitalocean")).toBeUndefined();
+    expect(sshConfig.foreignStanzaLine(lines, "mysql-ha-digitalocean-2")).toBe(4);
+  });
+
+  test("our own managed block is not foreign for any alias in it", () => {
+    // One block, marked with the profile, holding a stanza per member. Deriving
+    // the marker from the stanza being searched — which a single-node package
+    // can get away with — makes the check hunt for
+    // `# BEGIN mysql-ha-digitalocean-0 …`, never find it, and refuse to
+    // converge because of a block this package wrote itself.
+    const lines = [
+      "# BEGIN mysql-ha-digitalocean ANSIBLE MANAGED BLOCK",
+      "Host mysql-ha-digitalocean", "  HostName 1.2.3.4",
+      "Host mysql-ha-digitalocean-0", "  HostName 1.2.3.4",
+      "Host mysql-ha-digitalocean-1", "  HostName 1.2.3.5",
+      "Host mysql-ha-digitalocean-2", "  HostName 1.2.3.6",
+      "# END mysql-ha-digitalocean ANSIBLE MANAGED BLOCK",
+    ];
+    for (const alias of sshConfig.aliases(opts)) {
+      expect(sshConfig.foreignStanzaLine(lines, alias, "mysql-ha-digitalocean")).toBeUndefined();
+    }
+  });
+
+  test("a member stanza outside our block is still foreign", () => {
+    const lines = [
+      "# BEGIN mysql-ha-digitalocean ANSIBLE MANAGED BLOCK",
+      "Host mysql-ha-digitalocean", "  HostName 1.2.3.4",
+      "# END mysql-ha-digitalocean ANSIBLE MANAGED BLOCK",
+      "Host mysql-ha-digitalocean-1", "  HostName 9.9.9.9",
+    ];
+    expect(sshConfig.foreignStanzaLine(lines, "mysql-ha-digitalocean-1", "mysql-ha-digitalocean")).toBe(5);
+  });
+
+  test("a global option above the first Host blocks the run", () => {
+    // The block is inserted at BOF, so it would capture such an option into one
+    // stanza and silently narrow a setting that applied to every host.
+    expect(sshConfig.leadingOptionLine(["ServerAliveInterval 60", "Host x"])).toBe(1);
+    expect(sshConfig.leadingOptionLine(["# a comment", "", "Host x", "  User root"]))
+      .toBeUndefined();
+    // An option below a Host line belongs to that host and is fine.
+    expect(sshConfig.leadingOptionLine(["Host x", "  ServerAliveInterval 60"])).toBeUndefined();
+  });
+
+  test("the refusal is reported as a failed step", () => {
+    const refused = sshConfig.preflight(opts, {
+      adoptError: () => "no",
+      placementError: () => undefined,
+    });
+    expect(refused["red/exit"]).toBe(1);
+    expect(refused["red/err"]).toBe("no");
+    const passed = sshConfig.preflight(opts, {
+      adoptError: () => undefined,
+      placementError: () => undefined,
+    });
+    expect(passed["red/exit"]).toBeUndefined();
   });
 });

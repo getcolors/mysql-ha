@@ -7,8 +7,27 @@
 (def fixture
   (green-cli/read-state "colors.yml" (slurp "test/fixtures/colors.yml")))
 
+(def optout
+  (green-cli/read-state "optout.yml" (slurp "test/fixtures/optout.yml")))
+
 (deftest the-fixture-is-renderable
   (is (= [] (validate/state-errors fixture))))
+
+(deftest both-keypair-modes-are-renderable
+  ;; The SSH Keypair Standard has two modes and conformance means both hold.
+  (is (= [] (validate/state-errors optout)))
+  (is (validate/keygen? fixture))
+  (is (not (validate/keygen? optout))))
+
+(deftest the-machine-key-is-never-required
+  ;; Its absence is keygen mode, not a missing key.
+  (is (not-any? #(re-find #"digitalocean-ssh-keys" %) (validate/state-errors fixture))))
+
+(deftest the-private-key-path-is-desired-state-in-opt-out-mode-only
+  (is (some #{":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied"}
+            (validate/state-errors (dissoc optout :digitalocean-ssh-private-key))))
+  (testing "keygen mode names the generated key itself and asks for no path"
+    (is (= [] (validate/state-errors (dissoc fixture :digitalocean-ssh-private-key))))))
 
 (deftest every-required-key-is-required
   (doseq [k (concat validate/own-required

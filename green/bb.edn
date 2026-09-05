@@ -4,10 +4,14 @@
  {test {:doc "Run the Babashka unit suite"
         :requires ([clojure.test :as t]
                    [io.github.getcolors.mysql-ha.validate-test]
+                   [io.github.getcolors.mysql-ha.ssh-test]
+                   [io.github.getcolors.mysql-ha.ssh-config-test]
                    [io.github.getcolors.mysql-ha.tools-test]
                    [io.github.getcolors.mysql-ha.workflow-test])
         :task (let [{:keys [fail error]}
                     (t/run-tests 'io.github.getcolors.mysql-ha.validate-test
+                                 'io.github.getcolors.mysql-ha.ssh-test
+                                 'io.github.getcolors.mysql-ha.ssh-config-test
                                  'io.github.getcolors.mysql-ha.tools-test
                                  'io.github.getcolors.mysql-ha.workflow-test)]
                 (System/exit (if (pos? (+ fail error)) 1 0)))}
