@@ -4,7 +4,7 @@
 # dependencies = ["package-mysql-ha-blue", "blue"]
 #
 # [tool.uv.sources]
-# package-mysql-ha-blue = { git = "https://github.com/getcolors/mysql-ha.git", rev = "5d226c9801456101a595b39ae2365de92980137b", subdirectory = "blue" }
+# package-mysql-ha-blue = { git = "https://github.com/getcolors/mysql-ha.git", rev = "703b2204f73f696243765a8571e39ab58a0ff9cb", subdirectory = "blue" }
 # blue = { git = "https://github.com/getcolors/blue.git", rev = "290f313ead5ca162875c33a049c880da017eae09" }
 #
 # [tool.uv]
