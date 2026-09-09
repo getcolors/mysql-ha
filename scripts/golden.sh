@@ -70,9 +70,9 @@ checks() {
     [ -f "$base/mysql-ha-infrastructure/nodes/$node/node.tf.json" ] || exit 1
   done
   if [ "$fixture" = colors ]; then
-    grep -q "IdentityFile ~/.ssh/$profile" "$base/mysql-ha-ansible-local/main.yml" || exit 1
+    grep -q "colors_keygen: true" "$base/mysql-ha-ansible-local/main.yml" || exit 1
   else
-    grep -q 'IdentityFile ~/.ssh/id_ed25519' "$base/mysql-ha-ansible-local/main.yml" || exit 1
+    grep -q 'colors_keygen: false' "$base/mysql-ha-ansible-local/main.yml" || exit 1
   fi
   grep -q "$profile/mysql-ha-dns.tfstate" "$base/mysql-ha-dns/backend.tf.json"
 
