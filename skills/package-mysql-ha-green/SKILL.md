@@ -1,10 +1,10 @@
 ---
 name: package-mysql-ha-green
-description: Build and operate a three-member MySQL Group Replication cluster on DigitalOcean with Green — automatic failover onto a reserved IP, daily snapshots and continuous binary-log archiving to Cloudflare R2, and a scheduled verified restore.
+description: Build and operate a three-member MySQL Group Replication cluster with Green — automatic failover onto a reserved IP, daily snapshots and continuous binary-log archiving to Cloudflare R2, and a scheduled verified restore.
 license: MIT
 ---
 
-# MySQL Group Replication on DigitalOcean
+# MySQL Group Replication
 
 Read [references/configuration.md](references/configuration.md) before changing
 desired state or running a lifecycle command.
@@ -17,7 +17,7 @@ desired state or running a lifecycle command.
   explicit authorization.
 - Keep `compute-prevent-destroy: true`. Lift it for one authorized delete with
   `COLORS_PAR_COMPUTE_PREVENT_DESTROY=false`.
-- Restrict `digitalocean-ssh-sources` and `digitalocean-client-sources`; do not
+- Restrict `mysql-ssh-sources` and `mysql-client-sources`; do not
   use `0.0.0.0/0`. The MySQL port is a public port.
 - The design needs exactly two database credentials. Do not introduce a third.
 
@@ -37,18 +37,27 @@ credential at all.
 
 ## What it provisions
 
-Three identical droplets in the region's default VPC (discovered, never
-created), one reserved IP, one firewall, and Cloudflare records. On the members:
+Three identical machines on a private network, one application-assigned
+reserved IP, firewall rules, and Cloudflare records. On the members:
 MySQL 8.0 in single-primary Group Replication, plus six systemd units — the
 endpoint claimer, the heartbeat, the binary-log archiver, its uploader, the
 snapshot job, and the verified restore.
 
-The deployment owns its SSH keypair (keygen mode: leave `digitalocean-ssh-keys`
-out of `colors.yml`; the first real `create` generates `~/.ssh/<profile>` and
-registers it at DigitalOcean, and `delete` removes it last) and writes one
-`~/.ssh/config` block so that `ssh <profile>`, `ssh <profile>-0`, `-1` and
-`-2` reach the members. Supplying `digitalocean-ssh-keys` and
-`digitalocean-ssh-private-key` opts out and uses your own key untouched.
+Compute, SSH keys, and remote state are supplied by the pinned
+[colors-compute library](https://github.com/getcolors/colors-compute). Select a
+provider supported by that revision and configure its options and credentials.
+The package supplies three peer nodes and application network requirements;
+the library joins observed node addresses and SSH users for Ansible.
+
+Use `provider-backend: r2` or `s3`. R2 requires
+`COLORS_PAR_R2_ACCESS_KEY_ID` and `COLORS_PAR_R2_SECRET_ACCESS_KEY`; S3 uses
+the ambient AWS credential chain. The library owns managed profile keys, or
+uses configured external keys with `ssh-private-key-path`. Existing monolithic
+compute state requires explicit migration and is refused by this lifecycle.
+
+This package also requires the library capability for an application-assigned
+reserved IP. The library supplies the endpoint agent; MySQL decides when a
+member is eligible to claim the address.
 
 ## How failover works
 
@@ -57,8 +66,8 @@ member claims the reserved IP when that member is `ONLINE`, `PRIMARY` and not
 `super_read_only`. The Cloudflare record's content is the reserved IP and never
 changes, so OpenTofu keeps owning DNS while the cluster owns the assignment.
 
-`digitalocean_reserved_ip` is therefore created **without** `droplet_id`. Adding
-it would make every converge after a failover move the endpoint back.
+The library creates the reserved IP without a node assignment. MySQL retains
+assignment ownership across failovers and subsequent infrastructure converges.
 
 ## Backups and recovery
 

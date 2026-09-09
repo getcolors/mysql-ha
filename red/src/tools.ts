@@ -1,18 +1,3 @@
-// OpenTofu and Ansible stages for the three-member Group Replication cluster —
-// the port of io.github.getcolors.mysql-ha.tools.
-//
-// Two OpenTofu stages: `mysql-ha-infrastructure` owns the droplets, the
-// reserved IP and both firewalls; `mysql-ha-dns` owns the Cloudflare records.
-// One Ansible directory holds every playbook, because they share an inventory
-// and a set of rendered scripts and splitting them across directories would
-// duplicate both.
-//
-// The cluster itself — which machines exist, at which addresses — is the
-// Compute Cluster Standard's `params`, adopted through ONCE's `computeCluster`
-// module and carried under `once/cluster`. This package puts its own facts
-// inside it: `reserved_ip`, `vpc_id` and `vpc_ip_range` at the top level, a
-// `droplet_id` on every node.
-
 import * as ansible from "red/ansible";
 import { toolEnv } from "red/providers";
 import { PRESERVE_JINJA_DELIMITERS, contentSpec, scaffold, type Spec, type Template } from "red/scaffold";
@@ -20,7 +5,11 @@ import * as tofu from "red/tofu";
 import { runtime } from "red/runtime";
 import type { Opts } from "red/workflow";
 import { StepError, failed } from "red/workflow";
-import { compute, computeCluster } from "package-once-red";
+import {providers as onceBackends} from "package-once-red";
+import {orchestrate,plan_deployment,read_deployment,endpoint_agent} from "colors-compute-red";
+import * as compute from "./compute.ts";
+import {mkdirSync,writeFileSync} from "node:fs";
+import {dirname} from "node:path";
 import * as ssh from "./ssh.ts";
 import * as sshConfig from "./ssh-config.ts";
 import * as utils from "./utils.ts";
@@ -48,7 +37,7 @@ import filesMysqldCnf from "../resources/tools/ansible/files/mysqld.cnf" with { 
 import filesNodeEnv from "../resources/tools/ansible/files/node.env" with { type: "text" };
 import filesVerifyCnf from "../resources/tools/ansible/files/verify.cnf" with { type: "text" };
 import dnsMainTf from "../resources/tools/dns/main.tf" with { type: "text" };
-import infrastructureMainTf from "../resources/tools/infrastructure/main.tf" with { type: "text" };
+
 
 export const infrastructureTool = "mysql-ha-infrastructure";
 export const dnsTool = "mysql-ha-dns";
@@ -83,7 +72,6 @@ const templates: Record<string, string> = {
   "ansible/files/node.env": filesNodeEnv,
   "ansible/files/verify.cnf": filesVerifyCnf,
   "dns/main.tf": dnsMainTf,
-  "infrastructure/main.tf": infrastructureMainTf,
 };
 
 export function template(path: string, file: string): Template {
@@ -104,7 +92,7 @@ export function toolDir(opts: Opts, tool: string): string {
 }
 
 export function credentialEnv(opts: Opts, ...slots: string[]): Record<string, string> | undefined {
-  return toolEnv(validate.providers, opts, [...slots, "provider-backend"]);
+  return toolEnv({...validate.providers,"provider-backend":onceBackends["provider-backend"]!}, opts, [...slots, "provider-backend"]);
 }
 
 // The state backend of one OpenTofu stage, written before the stage runs.
@@ -123,218 +111,30 @@ function refuse(opts: Opts, errors: string[]): Opts {
 // ---------------------------------------------------------------------------
 // infrastructure
 
-// Stand-ins for the cluster facts beside the nodes, so `build` and `--dry-run`
-// render the same shape of file as a real run without ever reading state or
-// contacting a provider. Documentation-range values, so a rendered artifact
-// that leaked into a real run would fail loudly rather than reach something.
-// The nodes themselves are ONCE's fallbacks, cut from `spec`'s subnet at
-// offset 11.
-export const fallbackOutputs: Opts = {
-  reserved_ip: "192.0.2.10",
-  vpc_id: "00000000-0000-0000-0000-000000000000",
-  vpc_ip_range: "10.110.0.0/20",
-};
-
-// The droplet id a build renders for member `ordinal`; a real run reads every
-// id from state.
-const fallbackDropletId = (ordinal: number): number => 100000000 + ordinal;
-
-export function infrastructureSpecs(opts: Opts): Spec[] {
-  // The machine-key paths are filled here as well as in preflight, so the
-  // template renders the same bytes whichever step scaffolds it — the state
-  // reader renders it as a build, and a test may render it alone.
-  opts = ssh.withMachineKey(opts);
-  const dir = toolDir(opts, infrastructureTool);
-  const data: Opts = {
-    ...opts,
-    "node-count": utils.nodeCount(opts),
-    "digitalocean-ssh-sources-json":
-      JSON.stringify(compute.cidrs(opts, "digitalocean-ssh-sources")),
-    "digitalocean-client-sources-json":
-      JSON.stringify(compute.cidrs(opts, "digitalocean-client-sources")),
-  };
-  return [spec(template("infrastructure", "main.tf"), `${dir}/main.tf`, data)];
+const clusterNodes=(opts:Opts)=>compute.resolved(opts);
+export async function infrastructureStep(opts:Opts):Promise<Opts>{
+ const planning=opts['red/event']==='build'||opts['red/dry-run'];
+ const result:any=planning?plan_deployment(opts,compute.topology(opts),compute.requirements(opts)):await orchestrate(opts,compute.topology(opts),compute.requirements(opts));
+ if(!['planned','ready','destroyed'].includes(result.status))return refuse(opts,result.errors?.length?result.errors:['compute lifecycle refused; legacy monolithic state requires explicit migration']);
+ if(planning){
+  const sorted=(v:any):any=>Array.isArray(v)?v.map(sorted):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,sorted(v[k])])):v;
+  for(const [stage,docs] of [['shared',result.documents.shared],...Object.entries(result.documents.nodes).map(([id,docs])=>['nodes/'+id,docs])] as [string,Record<string,any>][])
+   for(const [filename,document] of Object.entries(docs)){const target=toolDir(opts,infrastructureTool)+'/'+stage+'/'+filename;mkdirSync(dirname(target),{recursive:true});writeFileSync(target,JSON.stringify(sorted(document),null,2)+'\n');}
+ }
+ const values:Opts={...opts,'red/exit':0};if(result.cluster){values['colors-compute/cluster']=result.cluster;values['colors-compute/shared']=result.shared??{};}
+ if(result.key?.private_key_path)values['ssh-private-key-path']=planning?result.key.private_key_path.replace('$HOME/.ssh','/home/build-placeholder/.ssh'):result.key.private_key_path;
+ return values;
+}
+export async function loadInfrastructureStep(opts:Opts,reader:typeof read_deployment=read_deployment):Promise<Opts>{
+ if(opts['red/event']==='build'||opts['red/dry-run'])return infrastructureStep(opts);
+ const result:any=await reader(opts);if(result.status==='destroyed')return {...opts,'mysql-ha/already-destroyed':true,'red/exit':0};
+ if(result.status!=='present')return refuse(opts,['compute state unavailable; legacy monolithic state requires explicit migration']);
+ return {...opts,'colors-compute/cluster':result.cluster,'colors-compute/shared':result.shared??{},'mysql-ha/infrastructure-present?':true,...(result.key?.private_key_path?{'ssh-private-key-path':result.key.private_key_path}:{}),'red/exit':0};
 }
 
-// The compute stage's `params` output, as ONCE reads it; undefined when the
-// apply reported none.
-export function outputParams(result: Opts): computeCluster.ClusterParams | undefined {
-  return computeCluster.outputParams({ "tofu/outputs": result["mysql-ha/outputs"] });
-}
-
-const nonBlank = (v: unknown): boolean =>
-  (typeof v === "number" && Number.isInteger(v)) || (typeof v === "string" && v.trim() !== "");
-
-// The extension keys this package puts inside `params`, which ONCE preserves
-// but does not read: a non-blank `reserved_ip` and `vpc_id`, a canonical
-// `vpc_ip_range`, and a non-blank `droplet_id` on every node. A real run is
-// refused without them; the legacy translation is held to the same rule.
-export function paramsErrors(params: computeCluster.ClusterParams): string[] {
-  const errors: string[] = [];
-  for (const k of ["reserved_ip", "vpc_id"]) {
-    if (!nonBlank(params[k])) errors.push(`compute state carries no ${k}`);
-  }
-  if (!nonBlank(params.vpc_ip_range)) {
-    errors.push("compute state carries no vpc_ip_range");
-  } else if (!computeCluster.ipv4Network(params.vpc_ip_range)) {
-    errors.push(`compute state vpc_ip_range ${JSON.stringify(params.vpc_ip_range)}`
-      + " is not a canonical IPv4 network such as 10.40.0.0/24");
-  }
-  const missing = (params.nodes ?? [])
-    .filter((n) => !nonBlank(n.droplet_id))
-    .map((n) => computeCluster.nodeIdStr(n));
-  if (missing.length > 0) {
-    errors.push(`compute state carries no droplet_id for ${missing.join(", ")}`);
-  }
-  return errors;
-}
-
-// `opts` once the adopted cluster passes `paramsErrors`, or the refusal.
-function checked(opts: Opts): Opts {
-  const errors = "once/cluster" in opts
-    ? paramsErrors(opts["once/cluster"] as computeCluster.ClusterParams) : [];
-  return errors.length > 0 ? refuse(opts, errors) : opts;
-}
-
-// What the infrastructure stage hands on after its apply: `result` as it is on
-// a failure, a delete or a build, and otherwise ONCE's `resolvedCluster` over
-// the apply's `params` output — undefined outputs and a partial cluster are
-// refused there — checked against `paramsErrors`. Pure, so the wiring is
-// testable without an apply.
-export function resolveInfrastructure(opts: Opts, result: Opts): Opts {
-  if (failed(result)) return result;
-  if (opts["red/event"] === "delete" || opts["red/event"] === "build") return result;
-  const resolved = computeCluster.resolvedCluster(validate.spec, opts, result, {}, outputParams(result));
-  return failed(resolved) ? resolved : checked(resolved);
-}
-
-export async function infrastructureStep(opts: Opts): Promise<Opts> {
-  const result = await tofu.tofuWithSpec(
-    opts, infrastructureSpecs(opts),
-    {
-      dir: toolDir(opts, infrastructureTool),
-      env: credentialEnv(opts, "provider-compute"),
-      outputKey: "mysql-ha/outputs",
-    });
-  return resolveInfrastructure(opts, result);
-}
-
-// A state written before this package recorded `params`: the parallel
-// `node_public_ips`, `node_private_ips` and `node_droplet_ids` lists, zipped
-// into the nodes the standard describes, with `reserved_ip`, `vpc_id` and
-// `vpc_ip_range` copied and the names this package has always given its
-// members. Refused, as the SDK's `StepError`, when the three lists disagree
-// with each other or with `cluster-nodes` — guessing which droplet is which is
-// how a delete destroys around a member — and when no `reserved_ip` was
-// recorded. A missing `vpc_id` or `vpc_ip_range` is `paramsErrors`' to refuse,
-// the same way for a legacy and a recorded state.
-export function legacyParams(opts: Opts, outputs: Record<string, unknown>): computeCluster.ClusterParams {
-  const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
-  const publics = list(outputs.node_public_ips);
-  const privates = list(outputs.node_private_ips);
-  const ids = list(outputs.node_droplet_ids);
-  const n = opts["cluster-nodes"];
-  if (!(n === publics.length && n === privates.length && n === ids.length)) {
-    throw new StepError(`legacy state lists ${publics.length} public addresses, `
-      + `${privates.length} private addresses and ${ids.length} droplet ids; `
-      + "refusing to guess the cluster");
-  }
-  if (!nonBlank(outputs.reserved_ip)) throw new StepError("legacy state carries no reserved_ip");
-  return {
-    provider: validate.defaultComputeProvider,
-    reserved_ip: outputs.reserved_ip,
-    vpc_id: outputs.vpc_id,
-    vpc_ip_range: outputs.vpc_ip_range,
-    nodes: Array.from({ length: n as number }, (_, i) => ({
-      index: i,
-      role: null,
-      name: utils.nodeName(opts, i + 1),
-      ip: publics[i] as string,
-      vpc_ip: privates[i] as string,
-      droplet_id: ids[i],
-      user: "root",
-      sudoer: "root",
-    })),
-  };
-}
-
-// The reader ONCE's `readState` takes: the compute `params` recorded in the
-// infrastructure state, undefined when the state is readable and holds
-// nothing, and the legacy translation when it holds only the pre-adoption
-// outputs. Delete and health both need the cluster and neither can re-derive
-// it — nor can a fresh clone, so the stage is rendered, its backend written
-// and initialized here, before the read. A failed initialization throws the
-// SDK's `StepError`, the shape `red/tofu` throws on an unreadable backend;
-// `readState` reports both fail-closed. Injectable into `startStep` and
-// `loadInfrastructureStep`, so tests never shell out to tofu.
-export async function stateOutput(opts: Opts): Promise<computeCluster.ClusterParams | undefined> {
-  const dir = toolDir(opts, infrastructureTool);
-  const env = credentialEnv(opts, "provider-compute");
-  scaffold({ ...opts, "red/event": "build" }, infrastructureSpecs(opts));
-  await backendAdvice(infrastructureTool)(opts);
-  const init = await runtime.exec(
-    ["tofu", `-chdir=${dir}`, "init", "-input=false", "-no-color"], { env });
-  if (init.exit !== 0) {
-    throw new StepError(`infrastructure state initialization failed: ${init.err || init.out || "(no output)"}`);
-  }
-  const outputs = await tofu.outputs(dir, env);
-  if ("params" in outputs) return outputs.params as computeCluster.ClusterParams;
-  if (Object.keys(outputs).length === 0) return undefined;
-  return legacyParams(opts, outputs);
-}
-
-// The health refusal when the state is readable and records no cluster: a
-// real run never checks the documentation addresses.
-export const noClusterMessage =
-  "the infrastructure state records no cluster; refusing to check the documentation addresses";
-
-// Adopt the cluster out of remote state without planning or changing anything:
-// ONCE's `adoptState` over the read `startStep` handed on under
-// `mysql-ha/state`, or a fresh read when nothing was. An unreadable backend and
-// a partial cluster fail closed; the adopted `params` must then pass
-// `paramsErrors`. A readable state without a cluster means there is nothing to
-// clean up on a delete and nothing to check on a health.
-export async function loadInfrastructureStep(
-  opts: Opts,
-  reader: compute.StateReader = stateOutput,
-): Promise<Opts> {
-  const event = String(opts["red/event"]);
-  const { "mysql-ha/state": handed, ...rest } = opts;
-  const state = "mysql-ha/state" in opts
-    ? handed as compute.StateRead
-    : await computeCluster.readState(opts, reader);
-  const adopted = computeCluster.adoptState(validate.spec, rest, event, state);
-  const present = "once/cluster" in adopted;
-  if (failed(adopted)) return adopted;
-  if (!present && event === "health") return refuse(adopted, [noClusterMessage]);
-  const result = checked(adopted);
-  if (failed(result)) return result;
-  return { ...result, "mysql-ha/infrastructure-present?": present };
-}
-
-// ---------------------------------------------------------------------------
-// shared template data
-
-// ONCE's nodes for this deployment: the adopted `params.nodes` on a real run,
-// the fallbacks on a build — renamed to what this package has always called
-// its members and given a documentation droplet id, so the rendered inventory
-// is byte-identical to what it was.
-function clusterNodes(opts: Opts): computeCluster.Node[] {
-  const params = opts["once/cluster"] as computeCluster.ClusterParams | undefined;
-  const members = computeCluster.nodes(validate.spec, opts, params);
-  if (params !== undefined && params !== null) return members;
-  return members.map((node) => ({
-    ...node,
-    name: utils.nodeName(opts, node.index + 1),
-    droplet_id: fallbackDropletId(node.index + 1),
-  }));
-}
-
-// One map per member, in ordinal order: desired state's derivations over the
-// node ONCE reports. Pure: given the same opts it is the same array, which is
-// what makes the inventory and the goldens deterministic.
 export function nodes(opts: Opts): Opts[] {
   return clusterNodes(opts).map((node) => {
+    if(!node.provider_id)throw Error("compute node provider identifier unavailable");
     const ordinal = node.index + 1;
     return {
       ordinal,
@@ -342,7 +142,7 @@ export function nodes(opts: Opts): Opts[] {
       host: utils.nodeHost(opts, ordinal),
       "public-ip": node.ip ?? null,
       "private-ip": node.vpc_ip ?? null,
-      "droplet-id": node.droplet_id ?? null,
+      uid:node.provider_id,user:node.user,
       "server-id": utils.serverId(ordinal),
       "connection-server-id": utils.connectionServerId(ordinal),
     };
@@ -358,31 +158,14 @@ export function groupSeeds(opts: Opts): string {
     .join(",");
 }
 
-// The private key every play reaches the members with: the generated key's
-// path in keygen mode (the build placeholder on a build or a dry-run), the
-// operator's `digitalocean-ssh-private-key` in opt-out mode.
-export function privateKeyFile(data: Opts): string {
-  return validate.keygen(data)
-    ? String(data["ssh-private-key-path"])
-    : String(data["digitalocean-ssh-private-key"]);
-}
-
-// Template data: desired state over the fallback cluster facts, with the
-// adopted cluster's `reserved_ip`, `vpc_id` and `vpc_ip_range` winning on a
-// real run, and the machine-key paths keygen mode owns.
-export function dataFn(opts: Opts): Opts {
-  opts = ssh.withMachineKey(opts);
-  const recorded = (opts["once/cluster"] ?? {}) as Opts;
-  const facts = Object.fromEntries(
-    Object.keys(fallbackOutputs).filter((k) => k in recorded).map((k) => [k, recorded[k]]));
-  const data = { ...fallbackOutputs, ...opts, ...facts };
-  return {
-    ...data,
-    "node-count": utils.nodeCount(opts),
-    "backup-prefix": utils.backupPrefix(opts),
-    "group-seeds": groupSeeds(data),
-    "cluster-record": utils.recordName(opts["cluster-host"]),
-  };
+export const privateKeyFile=(opts:Opts)=>String(opts['ssh-private-key-path']??'');
+export function dataFn(opts:Opts):Opts{
+ opts=ssh.withMachineKey(opts);
+ const shared=opts['colors-compute/shared']??((opts['red/event']==='build'||opts['red/dry-run'])?plan_deployment(opts,compute.topology(opts),compute.requirements(opts)).shared:{});
+ const facts=shared.params??{};if(!facts.network_cidr||!facts.endpoint_ip)throw Error('compute shared network or reserved endpoint unavailable');
+ const agent=endpoint_agent(opts['provider-compute']);
+ const data={...opts,'endpoint-credentials':agent.credentials,vpc_ip_range:facts.network_cidr,reserved_ip:facts.endpoint_ip};
+ return {...data,'node-count':utils.nodeCount(opts),'backup-prefix':utils.backupPrefix(opts),'group-seeds':groupSeeds(data),'cluster-record':utils.recordName(opts['cluster-host'])};
 }
 
 // Java's Double.toString, which is what Cheshire renders floats through and
@@ -443,11 +226,11 @@ export function inventory(opts: Opts): string {
         // Key order matches green's sorted-map: alphabetical.
         ansible_host: node["public-ip"],
         ansible_ssh_private_key_file: keyFile,
-        ansible_user: "root",
+        ansible_user: node.user,
         connection_server_id: node["connection-server-id"],
-        droplet_id: node["droplet-id"],
         node_host: node.host,
         node_ordinal: node.ordinal,
+        node_uid: node.uid,
         private_ip: node["private-ip"],
         server_id: node["server-id"],
       }] as const)
@@ -475,10 +258,11 @@ export function inventory(opts: Opts): string {
 // the play as extra-vars instead, so the rendered playbook carries no IP and is
 // identical on every workstation (SSH Config Standard §6).
 export function ansibleLocalData(opts: Opts): Opts {
+  opts=ssh.withMachineKey(opts);
   return {
     ...opts,
-    "ssh-keygen": validate.keygen(opts),
-    "ssh-config-identity-file": sshConfig.identityFile(opts),
+    "ssh-keygen": validate.keygen(opts) || Boolean(opts["ssh-private-key-path"]),
+    "ssh-config-identity-file": validate.keygen(opts) ? sshConfig.identityFile(opts) : opts["ssh-private-key-path"] || "",
     "host-alias": sshConfig.hostAlias(opts),
   };
 }
@@ -493,12 +277,7 @@ export function ansibleLocalSpecs(opts: Opts): Spec[] {
   ];
 }
 
-// The `~/.ssh/config` entries, as data the play loops over: the bare profile
-// pointing at node 0 (the spec's entry), then one alias per member. ONCE's
-// (Compute Cluster Standard §6).
-export function sshConfigHosts(opts: Opts): computeCluster.SshConfigHost[] {
-  return computeCluster.sshConfigHosts(validate.spec, opts, clusterNodes(opts));
-}
+export function sshConfigHosts(opts:Opts){const list=clusterNodes(opts);return [{...list[0],name:opts.profile},...list.map(node=>({...node,name:opts.profile+'-'+node.index}))];}
 
 // Write or remove the `~/.ssh/config` block. The same playbook serves both
 // events; `block_state` is what distinguishes them. Skipped on a delete whose
@@ -567,6 +346,7 @@ export function ansibleSpecs(opts: Opts): Spec[] {
       spec(template("ansible", playbook), `${dir}/${playbook}`, data)),
     ...nodeFiles.map((file) =>
       spec(template("ansible.files", file), `${dir}/files/${file}`, data)),
+    rawSpec(`${dir}/files/colors-compute-endpoint`, endpoint_agent(opts["provider-compute"]).content),
     rawSpec(`${dir}/inventory.json`, inventory(opts)),
   ];
 }

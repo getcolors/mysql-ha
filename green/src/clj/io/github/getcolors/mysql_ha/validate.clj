@@ -1,61 +1,17 @@
 (ns io.github.getcolors.mysql-ha.validate
-  "The provider registry and the desired-state rules it drives.
-
-  The compute registry is package-owned — this package ships its own
-  multi-node DigitalOcean template — and the operations over it are ONCE's
-  `compute-cluster` namespace, the one implementation of the Compute Cluster
-  Standard: selection, the required keys, the source lists, the provider
-  rules, the network mode and the topology are checked there over `spec`,
-  never copied here. What stays here is what only this package knows: the
-  fixed member count, the discovered VPC, and every MySQL rule.
-
-  Two credentials reach MySQL — the admin password and the replication
-  password — and the design is built to need no third. Nothing in here invents
-  one."
+  "Application rules backed by colors-compute."
   (:require [clojure.string :as str]
             [green.cli :as green-cli]
             [green.providers :as provider-ops]
-            [io.github.getcolors.once.compute :as compute]
-            [io.github.getcolors.once.compute-cluster :as cluster]
-            [io.github.getcolors.once.ssh :as once-ssh]
+            [io.github.getcolors.compute :as library]
+            [io.github.getcolors.compute-planning :as planning]
+            [io.github.getcolors.compute-ssh :as compute-ssh]
+            [io.github.getcolors.mysql-ha.compute :as compute]
             [io.github.getcolors.mysql-ha.utils :as utils]))
 
-(def compute-providers
-  "provider-compute -> what that choice implies.
-
-  `:required` are non-secret keys the template interpolates. `:secrets` arrive
-  only through `COLORS_PAR_*`. `:tofu-env` is the subset OpenTofu reads
-  natively from the process environment, so a credential never has to be
-  rendered into a .tf file sitting in the work directory in plaintext.
-  `:network` is `:discovered`: the region's default VPC, never one this
-  package owns. `digitalocean-ssh-keys` is deliberately absent from
-  `:required`: per the SSH Keypair Standard its absence selects keygen mode,
-  and its presence is the opt-out that passes the operator's key ids through
-  untouched."
-  {"digitalocean" {:required [:digitalocean-name :digitalocean-region
-                              :digitalocean-size :digitalocean-image
-                              :digitalocean-vpc-mode]
-                   :secrets [:do-token]
-                   :tofu-env {:do-token "DIGITALOCEAN_TOKEN"}
-                   :network {:mode :discovered}}})
-
-(def default-compute-provider
-  "The provider a deployment created before this package recorded one in its
-  compute output must be running: the only one it ever offered."
-  "digitalocean")
-
-(def spec
-  "How this package describes itself to ONCE's `compute-cluster`. One
-  homogeneous role of `cluster-nodes` members, whose fallback addresses start
-  at offset 11 so that `build` renders the same 192.0.2.11-13 and
-  10.110.0.11-13 it always did, with 192.0.2.10 left to the reserved IP. The
-  fallback subnet stands in for the discovered VPC's range on a build; on a
-  real run the range is the compute state's `vpc_ip_range`."
-  {:registry compute-providers
-   :default default-compute-provider
-   :sources {:non-empty ["ssh-sources" "client-sources"] :may-be-empty []}
-   :roles [{:role nil :count-key :cluster-nodes :count 3 :fallback-offset 11}]
-   :fallback-subnet "10.110.0.0/20"})
+(defn- entry-keys [entry] (-> entry (update :required #(mapv keyword %)) (update :secrets #(mapv keyword %))))
+(def compute-providers (into {} (map (fn [[name entry]] [(clojure.core/name name) (entry-keys entry)]) (:compute library/registry))))
+(def default-compute-provider "digitalocean")
 
 (def providers
   "Provider slot -> provider name -> what that choice implies. The compute
@@ -69,14 +25,10 @@
                   :tofu-env {:cloudflare-api-token "CLOUDFLARE_API_TOKEN"}}}
 
    :provider-backend
-   {"local" {:required [] :secrets [] :tofu-env {}}
-    "s3" {:required [:s3-bucket :s3-region] :secrets [] :tofu-env {}}
-    ;; R2 is S3-compatible, so it authenticates through the AWS chain. Naming
-    ;; the keys in backend.tf.json would also copy them into .terraform/.
-    "r2" {:required [:r2-bucket :r2-endpoint]
-          :secrets [:r2-access-key-id :r2-secret-access-key]
-          :tofu-env {:r2-access-key-id "AWS_ACCESS_KEY_ID"
-                     :r2-secret-access-key "AWS_SECRET_ACCESS_KEY"}}}})
+   (into {} (map (fn [[name entry]]
+                   [(clojure.core/name name) (cond-> (entry-keys entry)
+                                             (= name :r2) (assoc :tofu-env {:r2-access-key-id "AWS_ACCESS_KEY_ID" :r2-secret-access-key "AWS_SECRET_ACCESS_KEY"}))])
+                 (:backend library/registry)))})
 
 (def slots [:provider-compute :provider-dns :provider-backend])
 
@@ -88,7 +40,6 @@
 (def own-required
   [:profile :workdir
    :cluster-host :cluster-nodes
-   :digitalocean-ssh-sources :digitalocean-client-sources
    :cloudflare-proxied
    :mysql-port :mysql-group-port :mysql-group-name
    :mysql-admin-user :mysql-replication-user
@@ -109,12 +60,8 @@
 
 (defn placeholder? [x] (provider-ops/placeholder? x))
 
-(defn keygen?
-  "Whether this deployment owns its machine keypair: `digitalocean-ssh-keys`
-  is absent. Delegates to ONCE, the standard's reference implementation, so
-  one rule decides it everywhere."
-  [opts]
-  (once-ssh/keygen? opts))
+(defn keygen? [opts]
+  (try (= "managed" (:mode (compute-ssh/mode opts))) (catch Exception _ true)))
 
 (def profile-par (green-cli/par-name :profile))
 
@@ -141,18 +88,12 @@
 (defn- positive-int? [x] (and (integer? x) (pos? x)))
 
 (defn state-errors
-  "Everything wrong with `opts` that does not depend on a credential. Empty
-  means the desired state renders. The missing keys are this package's, the
-  selected compute provider's (ONCE's `compute/required-keys`) and the other slots';
-  the package's own rules follow; the Compute Cluster Standard's — selection,
-  the source lists, the provider and network rules, the topology — are ONCE's
-  over `spec` and come last."
+  "Application constraints plus pure library capability validation."
   [opts]
   (vec
    (concat
     (map #(str % " is required")
          (missing opts (concat own-required
-                               (compute/required-keys spec opts)
                                (slot-keys opts own-slots :required))))
     (for [slot own-slots
           :let [p (get opts slot)]
@@ -176,12 +117,10 @@
     ;; path to it is desired state there; keygen mode names the generated key
     ;; itself and must not be asked for one.
     (when (and (not (keygen? opts))
-               (placeholder? (:digitalocean-ssh-private-key opts)))
-      [":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied"])
+               (placeholder? (:private_key_path (compute-ssh/mode opts))))
+      [":ssh-private-key-path is required for external SSH access"])
     (when-not (= 3 (:cluster-nodes opts))
       [":cluster-nodes must be 3; a Group Replication majority needs an odd group and the budget is three droplets"])
-    (when-not (= "default" (:digitalocean-vpc-mode opts))
-      [":digitalocean-vpc-mode must be default; the VPC is discovered at run time and is never desired state"])
     (when-not (or (placeholder? (:mysql-group-name opts))
                   (re-matches uuid-re (str (:mysql-group-name opts))))
       [":mysql-group-name must be a UUID; MySQL rejects anything else as a group name"])
@@ -206,7 +145,10 @@
                (not (placeholder? (:r2-bucket opts)))
                (= (str (:backup-r2-bucket opts)) (str (:r2-bucket opts))))
       [":backup-r2-bucket must not be the state bucket"])
-    (cluster/state-errors spec opts))))
+    (library/validate opts)
+    (when (empty? (library/validate opts))
+      (try (planning/plan-deployment opts (compute/topology opts) (compute/requirements opts)) []
+           (catch Exception error [(.getMessage error)]))))))
 
 (defn secret-errors
   "Credentials a real run needs that no `COLORS_PAR_*` variable supplied.
@@ -216,7 +158,7 @@
   provider credentials and none of the database ones."
   [opts]
   (let [ks (if (= :health (:green/event opts))
-             (slot-keys opts slots :secrets)
-             (concat (slot-keys opts slots :secrets) own-secrets))]
+             (slot-keys opts own-slots :secrets)
+             (concat (slot-keys opts own-slots :secrets) own-secrets))]
     (mapv #(str "required credential is not set: " (green-cli/par-name %))
           (distinct (missing opts ks)))))

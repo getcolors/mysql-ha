@@ -9,7 +9,7 @@ workdir: .colors
 
 provider-compute: digitalocean
 provider-dns: cloudflare
-provider-backend: local
+provider-backend: r2
 
 compute-prevent-destroy: true
 
@@ -53,3 +53,6 @@ endpoint-poll-interval: 10s
 
 r2-bucket: fixture-state
 r2-endpoint: https://fixture.r2.cloudflarestorage.com
+
+s3-bucket: fixture-state
+s3-region: eu-west-1

@@ -9,9 +9,9 @@ exits 2.
 
 | Key | Values | Notes |
 |---|---|---|
-| `provider-compute` | `digitalocean` | the only implementation |
+| `provider-compute` | Library-supported provider | Must support application-assigned reserved IPs |
 | `provider-dns` | `cloudflare` | the only implementation |
-| `provider-backend` | `local`, `s3`, `r2` | where OpenTofu state lives |
+| `provider-backend` | `s3`, `r2` | where OpenTofu state lives |
 
 ## Identity
 
@@ -28,23 +28,17 @@ exits 2.
 | `cluster-host` | the client endpoint, e.g. `my-ha.example.com`. Must sit inside `cloudflare-zone`. |
 | `cluster-nodes` | must be `3`. A Group Replication majority needs an odd group, and the node budget is three. |
 
-## DigitalOcean
+## Compute
 
-| Key | Meaning |
-|---|---|
-| `digitalocean-name` | droplet name prefix; members are `<name>-node-1..3` |
-| `digitalocean-region` | e.g. `ams3` |
-| `digitalocean-size` | e.g. `s-2vcpu-4gb` |
-| `digitalocean-image` | e.g. `ubuntu-24-04-x64` |
-| `digitalocean-ssh-keys` | **optional** — leave it out and the deployment owns its keypair: `create` generates `~/.ssh/<profile>`, registers its public half at DigitalOcean under the profile's name, and `delete` removes both last (the workspace SSH Keypair Standard). Supply an SSH key **already registered** on the account, by ID or fingerprint, to opt out; nothing is then generated or uploaded. |
-| `digitalocean-ssh-private-key` | opt-out mode only: the private half of `digitalocean-ssh-keys` on this machine, used by Ansible. Refused as a requirement in keygen mode, where the generated key is used. |
-| `digitalocean-ssh-sources` | list of CIDRs allowed to SSH |
-| `digitalocean-client-sources` | list of CIDRs allowed to reach the MySQL port |
-| `digitalocean-vpc-mode` | must be `default`. The region's default VPC is discovered at run time; there is no VPC UUID, no VPC CIDR and no VPC resource in desired state. |
+Provider options and credentials follow the revision of
+[colors-compute](https://github.com/getcolors/colors-compute) pinned by the
+skill. Machines default to `<profile>-<node-id>`; the provider name option
+overrides the prefix. A compatible provider addition requires a dependency bump.
 
-`digitalocean-ssh-sources` and `digitalocean-client-sources` are separate on
-purpose: administrative access and client access are different populations, and
-the MySQL port is genuinely public.
+`mysql-ssh-sources` and `mysql-client-sources` restrict administrative and client
+access separately. The corresponding provider-prefixed keys remain accepted by
+the library. Cluster traffic uses the observed private network range. The
+library rejects unsupported private filtering and endpoint capabilities.
 
 ## DNS
 

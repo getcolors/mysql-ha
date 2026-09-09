@@ -63,53 +63,24 @@ checks() {
       echo "$profile: missing playbook $playbook" >&2; exit 1; }
   done
 
-  local infra="$base/mysql-ha-infrastructure/main.tf"
-  # The VPC is discovered, never owned.
-  grep -q 'data "digitalocean_vpc" "cluster"' "$infra"
-  if grep -q 'resource "digitalocean_vpc"' "$infra"; then
-    echo "$profile: the package must not own a VPC" >&2; exit 1
-  fi
-  # Three members and no more.
-  grep -qE 'count *= *3' "$infra"
-  # The reserved IP must never carry an assignment in desired state. The check
-  # is scoped to the resource block: the `params` output reports each droplet's
-  # id, which is a fact about the members, not an assignment of the endpoint.
-  grep -q 'resource "digitalocean_reserved_ip" "endpoint"' "$infra"
-  if sed -n '/^resource "digitalocean_reserved_ip" "endpoint" {/,/^}/p' "$infra" \
-       | grep -qE '^\s*droplet_id\s*='; then
-    echo "$profile: the reserved IP assignment must not be desired state" >&2; exit 1
-  fi
-  # Every destroyable resource is guarded.
-  [ "$(grep -c 'prevent_destroy = true' "$infra")" -ge 3 ] || {
-    echo "$profile: a destroyable resource is unguarded" >&2; exit 1; }
-  # The group port is never open to the world.
-  if grep -qE 'port_range *= *"33061"' "$infra"; then
-    echo "$profile: the group replication port is in a public firewall rule" >&2; exit 1
-  fi
-  # The SSH Keypair Standard, both modes: keygen declares the profile-named key
-  # resource and references it by attribute; opt-out keeps the literal id and
-  # creates nothing.
+  # Compute documents are library-owned; this package checks its topology and
+  # the SSH identities consumed by application stages.
+  [ -d "$base/mysql-ha-infrastructure/shared" ] || exit 1
+  for node in 0 1 2; do
+    [ -f "$base/mysql-ha-infrastructure/nodes/$node/node.tf.json" ] || exit 1
+  done
   if [ "$fixture" = colors ]; then
-    grep -q 'resource "digitalocean_ssh_key" "machine"' "$infra" || { echo "$profile: keygen mode declares no key resource" >&2; exit 1; }
-    grep -q 'ssh_keys = \[digitalocean_ssh_key.machine.id\]' "$infra" || { echo "$profile: keygen mode does not reference the key by attribute" >&2; exit 1; }
-    grep -q 'ssh_key_id   = digitalocean_ssh_key.machine.id' "$infra" || { echo "$profile: params carries no ssh_key_id" >&2; exit 1; }
-    grep -q 'IdentityFile ~/.ssh/mysql-ha-fixture' "$base/mysql-ha-ansible-local/main.yml" || { echo "$profile: the local stage names no identity file" >&2; exit 1; }
-    grep -q '"ansible_ssh_private_key_file" : "/home/build-placeholder/.ssh/mysql-ha-fixture"' "$base/mysql-ha-ansible/inventory.json" || { echo "$profile: the inventory does not name the generated key" >&2; exit 1; }
+    grep -q "IdentityFile ~/.ssh/$profile" "$base/mysql-ha-ansible-local/main.yml" || exit 1
   else
-    ! grep -q 'digitalocean_ssh_key' "$infra" || { echo "$profile: opt-out mode must create no key" >&2; exit 1; }
-    grep -q 'ssh_keys = \["12345678"\]' "$infra" || { echo "$profile: opt-out mode lost the literal key id" >&2; exit 1; }
-    ! grep -qE '^\s+IdentityFile ' "$base/mysql-ha-ansible-local/main.yml" || { echo "$profile: opt-out mode must not guess an identity file" >&2; exit 1; }
+    grep -q 'IdentityFile ~/.ssh/id_ed25519' "$base/mysql-ha-ansible-local/main.yml" || exit 1
   fi
-
-  if [ "$backend" = r2 ]; then
-    grep -q "$profile/mysql-ha-infrastructure.tfstate" "$base/mysql-ha-infrastructure/backend.tf.json"
-  fi
+  grep -q "$profile/mysql-ha-dns.tfstate" "$base/mysql-ha-dns/backend.tf.json"
 
   local dns="$base/mysql-ha-dns/main.tf"
   grep -q 'proxied = false' "$dns"
   grep -q 'name    = "my-ha.fixture.example"' "$dns"
   # The client record points at the reserved IP, not at a member.
-  grep -q 'content = "192.0.2.10"' "$dns"
+  grep -q 'content = "198.51.100.10"' "$dns"
 
   local cnf="$base/mysql-ha-ansible/files/mysqld.cnf"
   for setting in 'gtid_mode                = ON' \
@@ -129,8 +100,11 @@ checks() {
       echo "$profile: missing runtime lookup for $secret" >&2; exit 1; }
   done
 
-  if grep -rEq 'BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY|REPLACE_ME|github_pat_|ghp_|gho_|ghu_|ghs_|ghr_' "$base"; then
+  if grep -rEq 'BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY|github_pat_|ghp_|gho_|ghu_|ghs_|ghr_' "$base"; then
     echo "$profile: credential-shaped value rendered" >&2; exit 1
+  fi
+  if grep -rq --exclude=colors-compute-endpoint 'REPLACE_ME' "$base"; then
+    echo "$profile: unresolved configuration placeholder" >&2; exit 1
   fi
   # A Selmer tag that survived rendering is a typo or an unsupplied key.
   if grep -rn '<{' "$base"; then
@@ -150,7 +124,7 @@ checks() {
 }
 
 for fixture in colors optout; do
-  for backend in local r2; do
+  for backend in s3 r2; do
     build "$fixture" "$backend"
   done
 done

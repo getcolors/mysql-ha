@@ -21,19 +21,6 @@ export function ordinals(opts: Opts): number[] {
   return Array.from({ length: nodeCount(opts) }, (_, i) => i + 1);
 }
 
-// The DigitalOcean droplet name for member `ordinal`, and the Ansible
-// inventory host alias. One name, so a droplet in the console and a host in a
-// play recap are obviously the same thing.
-export function nodeName(opts: Opts, ordinal: number): string {
-  return `${opts["digitalocean-name"]}-node-${ordinal}`;
-}
-
-export function nodeNames(opts: Opts): string[] {
-  return ordinals(opts).map((ordinal) => nodeName(opts, ordinal));
-}
-
-// MySQL `server_id`. Distinct per member and stable across rebuilds, because
-// it is derived from the ordinal rather than from an address.
 export function serverId(ordinal: number): number {
   return 100 + ordinal;
 }

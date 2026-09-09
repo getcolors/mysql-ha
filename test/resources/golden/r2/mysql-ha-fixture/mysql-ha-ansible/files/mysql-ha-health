@@ -79,12 +79,10 @@ check "$([ "$resolved" = "$RESERVED_IP" ] && echo ok || echo no)" endpoint-dns \
       "${CLUSTER_HOST} resolves to ${resolved:-nothing} (reserved ${RESERVED_IP})"
 
 if [ "$role" = PRIMARY ]; then
-  holder=$(curl -sS --fail-with-body --max-time 20 \
-             -H "Authorization: Bearer ${DO_TOKEN}" \
-             "https://api.digitalocean.com/v2/reserved_ips/${RESERVED_IP}" \
-           | jq -r '.reserved_ip.droplet.id // empty')
-  check "$([ "$holder" = "$DROPLET_ID" ] && echo ok || echo no)" endpoint-assignment \
-        "reserved IP held by droplet ${holder:-none}, primary is ${DROPLET_ID}"
+  holder=$(/usr/local/bin/colors-compute-endpoint --provider "$COMPUTE_PROVIDER" \
+             --ip "$RESERVED_IP" --action status | jq -r '.node_id // empty')
+  check "$([ "$holder" = "$NODE_UID" ] && echo ok || echo no)" endpoint-assignment \
+        "reserved IP held by node ${holder:-none}, primary is ${NODE_UID}"
 fi
 
 # --- a snapshot landed in the backup bucket ----------------------------------

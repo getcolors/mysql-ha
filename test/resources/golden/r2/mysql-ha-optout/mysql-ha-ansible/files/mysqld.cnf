@@ -43,7 +43,7 @@ plugin_load_add = 'group_replication.so'
 
 group_replication_group_name   = "9f8c1d7e-0e6a-4c2b-9a54-6f1b2c3d4e5f"
 group_replication_local_address = "{{ private_ip }}:33061"
-group_replication_group_seeds  = "10.110.0.11:33061,10.110.0.12:33061,10.110.0.13:33061"
+group_replication_group_seeds  = "10.0.0.10:33061,10.0.0.11:33061,10.0.0.12:33061"
 
 # Single primary: one writer, automatic election, no write-conflict rollbacks
 # for the application to handle.
@@ -52,7 +52,7 @@ group_replication_enforce_update_everywhere_checks = OFF
 
 # The group port never leaves the VPC. The firewall says the same thing; this
 # is the server saying it as well.
-group_replication_ip_allowlist = "10.110.0.0/20"
+group_replication_ip_allowlist = "10.0.0.0/24"
 
 # The replication account uses caching_sha2_password, MySQL 8's default. Over a
 # connection with no server certificate the client has to fetch the server's

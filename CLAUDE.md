@@ -42,10 +42,10 @@ fixture (no `digitalocean-ssh-keys`: the package owns the keypair) and
 `test/fixtures/optout.yml` is the opt-out fixture (an explicit key id: the
 package touches no key material and renders byte-for-byte what it rendered
 before the SSH Keypair Standard, under its own profile). Each is rendered
-under the **local** state backend and again under **r2**
+under the **s3** state backend and again under **r2**
 (`COLORS_PAR_PROVIDER_BACKEND=r2` overlaid on the same file). The four
 committed trees live at
-`test/resources/golden/{local,r2}/mysql-ha-{fixture,optout}/`; the backend
+`test/resources/golden/{s3,r2}/mysql-ha-{fixture,optout}/`; the backend
 pair differs only in each OpenTofu stage's `backend.tf.json`.
 `scripts/golden.sh` checks green against all four; `scripts/parity.sh`
 renders all four through every colour and diffs the trees — and the colour
@@ -59,43 +59,32 @@ committed flag.
 
 ## Coupling
 
-The package pins the SDK — Green in `green/deps.edn`, the Red SDK in
-`red/package.json`, the Blue SDK in `blue/pyproject.toml` — and ONCE, in the
-same three manifests and in the red payload's `PINS`, for two namespaces:
-`compute-cluster` (`io.github.getcolors.once.compute-cluster`,
-`package-once-red`'s `computeCluster`, `package_once_blue.compute_cluster`),
-the one implementation of the Compute Cluster Standard
-(`workspace/standards/compute-cluster.md`), and `ssh`
-(`io.github.getcolors.once.ssh`, ONCE's unexported `red/src/ssh.ts` reached
-through `red/src/once.ts`, `package_once_blue.ssh`), the reference
-implementation of the SSH Keypair Standard (`workspace/standards/ssh-keypair.md`).
-The package's `ssh` module wraps ONCE's with the build placeholder; its
-`ssh_config` module and its `ansible-local` play are its own copies of the
-multi-node shape every DB package carries (`workspace/standards/ssh-config.md`
-§7; `workspace/scripts/package-copies.py` gates the copies), writing one
-`~/.ssh/config` block marked with the profile that holds a stanza per alias
-(`<profile>`, `<profile>-0..2`). Keygen mode is the absence of
-`digitalocean-ssh-keys`; `digitalocean-ssh-private-key` is required in opt-out
-mode only. On a real create the keypair matrix and the DigitalOcean key
-preflight run in `start-step` before anything renders; the block is written
-after the infrastructure stage and withdrawn before the destroy; the keypair
-is removed last, after the destroy.
-The package owns its `compute-providers` registry, its `spec` (one
-homogeneous role of `cluster-nodes` members, fallback offset 11, the
-`10.110.0.0/20` fallback subnet, a discovered network), its own validators
-and its `params-errors`; ONCE owns selection, the source lists, the network
-and topology checks, the fallback nodes, `read-state`, `adopt-state`,
-`resolved-cluster` and the provider-switch guard. The compute state is the
-template's `params` output — `provider`, `reserved_ip`, `vpc_id`,
-`vpc_ip_range`, and one node per member with its `droplet_id` — adopted
-under `:once/cluster`; a pre-adoption state, which recorded only the parallel
-`node_public_ips`/`node_private_ips`/`node_droplet_ids` lists, is translated
-into the same shape by the reader in `tools`, and refused when the lists
-disagree. Use `MYSQL_HA_LIB_ROOT` (the repository root, for every colour; red
-also accepts the `red/` dir directly), `GREEN_LIB_ROOT` and `ONCE_LIB_ROOT`
-for working-tree development. Final launchers use a pushed SHA managed by
-`bb pin` (run in `green/`), which stamps all three payloads from their
-unpinned birth forms; deployment launchers are copies, not symlinks.
+Every color depends on the pinned colors-compute library for compute, remote
+state, provider credentials, SSH keys, topology expansion, and lifecycle
+ownership. The package declares three homogeneous peers and application network
+requirements. Colors fans out the same library node operation, then joins
+complete observed outputs for Ansible and DNS. ONCE remains only for application
+DNS helpers and its separate backend credential binding.
+
+Provider templates and registries belong to the library. Supporting another
+compatible provider requires a dependency bump, without application source or
+provider fixture changes. Build and dry-run use documentation addresses and a
+placeholder home without reading local keys. Real operations validate remote
+ownership before generating keys or invoking a compute provider. Existing
+monolithic compute state requires an explicit migration; it is never silently
+adopted. Local SSH config plays remain package-owned and use observed SSH users
+and the selected identity path.
+
+Manifests and lockfiles pin published dependencies. Publish package source before
+running `bb pin` in `green/`, then publish the stamped launcher copies. Red
+launchers resolve compute and SDK transitively through the pinned package;
+repeating these Git dependencies breaks cold installation in Bun 1.3.13.
+
+The library creates the reserved IP without assigning it to a node and supplies
+the endpoint agent. MySQL retains the ONLINE/PRIMARY/read-write eligibility gates
+and invokes that agent for assignment. Provider API code and credentials must
+not return to the application endpoint scripts.
+
 
 ## Architecture
 
@@ -106,16 +95,8 @@ delete  start ─ load-infrastructure ─ cleanup ─ dns ─ infrastructure
 health  start ─ load-infrastructure ─ health
 ```
 
-`dns` and `base` fork and join at `cluster`. Stage names are remote-state keys
-(`<profile>/mysql-ha-infrastructure.tfstate`) and must not move.
-
-The package keeps its own multi-node DigitalOcean template rather than
-ONCE's single-server one, the way `k8s` decided; what it takes from ONCE is
-the cluster contract over that template, never the template itself. Every
-machine in the account's regional default VPC is inside the cluster's
-east-west trust boundary — the group port and the all-ports VPC rules take
-`data.digitalocean_vpc.cluster.ip_range` as their source — which the standard
-names as a security exception of a discovered network.
+`dns` and `base` fork and join at `cluster`. Application stage names remain stable. Compute state is split into shared and
+per-node objects under `<profile>/compute/`, with a deployment journal.
 
 Four things are load-bearing and easy to break:
 

@@ -33,7 +33,7 @@ ok 'each colour dir symlinks its skill payload'
 mkdir "$tmp/project"; cp "$launcher" "$tmp/project/green"; chmod +x "$tmp/project/green"
 cp "$root/test/fixtures/colors.yml" "$tmp/project/colors.yml"
 (cd "$tmp/project" && MYSQL_HA_LIB_ROOT="$root" ./green build >/dev/null) || fail 'working-tree override failed'
-[ -f "$tmp/project/.colors/mysql-ha-fixture/mysql-ha-infrastructure/main.tf" ] || fail 'render missing'
+[ -f "$tmp/project/.colors/mysql-ha-fixture/mysql-ha-infrastructure/shared/shared.tf.json" ] || fail 'render missing'
 ok 'working-tree override renders from a copied payload'
 
 mkdir -p "$tmp/project/deep/path"

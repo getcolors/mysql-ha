@@ -1,22 +1,10 @@
-// The lifecycle graph, preflight, and the backend advice each OpenTofu stage
-// runs behind — the port of io.github.getcolors.mysql-ha.workflow.
-//
-// Create forks after the infrastructure: Cloudflare and apt have nothing to say
-// to each other, so `dns` and `base` run in parallel and join at `cluster`.
-// Joining DNS there rather than leaving it dangling means a bad zone or a
-// missing token surfaces before any data-plane work starts.
-//
-// Delete and health both begin by adopting the cluster out of remote state,
-// because neither can re-derive it. The state is read once, in preflight, so
-// the Compute Provider Standard's switch guard runs before the credentials are
-// checked; the read is handed to `load-infrastructure` rather than repeated.
 
 import { parName, readPars } from "red/cli";
 import * as dryRun from "red/dry-run";
 import { preflight, type PreflightContext } from "red/lifecycle";
 import * as progress from "red/progress";
 import { adviceAdd, failed, workflow, type Opts, type WireDecl } from "red/workflow";
-import { compute, computeCluster } from "package-once-red";
+
 import * as ssh from "./ssh.ts";
 import * as sshConfig from "./ssh-config.ts";
 import * as tools from "./tools.ts";
@@ -26,7 +14,7 @@ export const defaults: Opts = {
   "compute-prevent-destroy": true,
   "provider-compute": validate.defaultComputeProvider,
   "provider-dns": "cloudflare",
-  "provider-backend": "local",
+  "provider-backend": "r2",
   workdir: ".colors",
 };
 
@@ -37,63 +25,11 @@ export const credentialEvents = ["create", "delete", "health"];
 const realCredentialEvent = ({ event, real }: PreflightContext): boolean =>
   real && credentialEvents.includes(String(event));
 
-// Preflight. On a real create, delete or health the compute state is read
-// once through `reader` — the package's `tools.stateOutput` unless a test
-// injects another — on the same defaulted and overlaid opts the validators
-// see, and only once desired state itself has passed, so the reader never
-// renders an invalid colors.yml. The read feeds the switch guard here and
-// travels on under `mysql-ha/state` for `load-infrastructure` to adopt.
-export async function startStep(
-  opts: Opts,
-  env: Record<string, string | undefined> = process.env,
-  reader: compute.StateReader = tools.stateOutput,
-): Promise<Opts> {
-  const overlaid = readPars({ ...defaults, ...opts }, env);
-  const context: PreflightContext = {
-    event: typeof overlaid["red/event"] === "string" ? overlaid["red/event"] as string : undefined,
-    real: !overlaid["red/dry-run"],
-  };
-  const state: compute.StateRead =
-    realCredentialEvent(context)
-      && validate.envErrors(env).length === 0
-      && validate.stateErrors(overlaid).length === 0
-      ? await computeCluster.readState(overlaid, reader)
-      : {};
-  return preflight(opts, {
-    defaults,
-    overlay: readPars,
-    validators: [
-      (_opts, environment) => validate.envErrors(environment),
-      (current) => validate.stateErrors(current),
-      // Standard §4 before the credentials: a recorded provider that differs
-      // from the selected one reports the actionable error, not a missing
-      // token for the provider that was just selected.
-      (current, _environment, ctx) => (realCredentialEvent(ctx)
-        ? computeCluster.providerValidator(validate.spec, current, state.params, () => validate.secretErrors(current))
-        : []),
-      (current, _environment, { event, real }) =>
-        real && event === "delete" && current["compute-prevent-destroy"]
-          ? [`compute destruction is protected; set ${parName("compute-prevent-destroy")}=false to delete`]
-          : [],
-    ],
-    // The machine key's create matrix and the DigitalOcean preflight run
-    // before any template is rendered: an unowned key on disk or at the
-    // provider stops the run while stopping is still free. Every other event
-    // fills the same template values — a destroy renders before it destroys, a
-    // health reaches the members with the key — but checks no key, because the
-    // delete's key cleanup runs after the compute destroy.
-    afterValidate: async (current, _environment, ctx) => {
-      const handed = realCredentialEvent(ctx) ? { ...current, "mysql-ha/state": state } : current;
-      if (ctx.real && ctx.event === "create") {
-        let next = await ssh.ensureKey(handed, async () => state.params);
-        if (failed(next)) return next;
-        next = await ssh.preflight(ssh.withMachineKey(next));
-        if (!failed(next)) next = sshConfig.preflight(next);
-        return failed(next) ? next : { ...next, "red/exit": 0 };
-      }
-      return { ...ssh.withMachineKey(handed), "red/exit": 0 };
-    },
-  }, env);
+export async function startStep(opts:Opts,env:Record<string,string|undefined>=process.env):Promise<Opts>{
+ return preflight(opts,{defaults,overlay:readPars,validators:[(_o,e)=>validate.envErrors(e),o=>validate.stateErrors(o),
+  (o,_e,c)=>realCredentialEvent(c)&&!validate.stateErrors(o).length?validate.secretErrors(o):[],
+  (o,_e,c)=>c.real&&c.event==='delete'&&o['compute-prevent-destroy']?['compute destruction is protected; set COLORS_PAR_COMPUTE_PREVENT_DESTROY=false for this one delete']:[]],
+ afterValidate:async(current,_e,c)=>c.real&&c.event==='create'?sshConfig.preflight(current):{...ssh.withMachineKey(current),'red/exit':0}},env);
 }
 
 export function wireFn(step: string, runOpts: Opts): WireDecl | undefined {
@@ -109,8 +45,7 @@ export function wireFn(step: string, runOpts: Opts): WireDecl | undefined {
       "mysql-ha/cleanup": [tools.cleanupStep, "mysql-ha/ansible-local"],
       "mysql-ha/ansible-local": [tools.ansibleLocalStep, "mysql-ha/dns"],
       "mysql-ha/dns": [tools.dnsStep, "mysql-ha/infrastructure"],
-      "mysql-ha/infrastructure": [tools.infrastructureStep, "mysql-ha/ssh-cleanup"],
-      "mysql-ha/ssh-cleanup": [ssh.cleanupStep],
+      "mysql-ha/infrastructure": [tools.infrastructureStep],
     };
     return graph[step];
   }
@@ -149,20 +84,10 @@ export const sideEffecting = [
   "mysql-ha/health", "mysql-ha/cleanup", "mysql-ha/ssh-cleanup",
 ];
 
-function create() {
-  let wf = workflow({ start: "mysql-ha/start", wireFn });
-  wf = progress.advise(wf);
-  wf = dryRun.advise(wf, sideEffecting);
-  for (const tool of tools.tofuTools) {
-    wf = adviceAdd(wf, `mysql-ha/${tool.slice("mysql-ha-".length)}`, "before",
-      `io.github.getcolors.mysql-ha.workflow/backend-${tool}`, backendAdvice(tool));
-  }
-  // `load-infrastructure` runs `tofu init` in the infrastructure stage's
-  // own directory, so it needs that stage's backend written first — the
-  // same advice, targeted at a different step.
-  return adviceAdd(wf, "mysql-ha/load-infrastructure", "before",
-    "io.github.getcolors.mysql-ha.workflow/backend-load-infrastructure",
-    backendAdvice(tools.infrastructureTool));
+function create(){
+ let wf=workflow({start:'mysql-ha/start',wireFn,nextFn:(_step,next,opts)=>opts['mysql-ha/already-destroyed']||failed(opts)?[]:(next??[]).map(step=>[step,opts])});
+ wf=progress.advise(wf);wf=dryRun.advise(wf,sideEffecting);
+ return adviceAdd(wf,'mysql-ha/dns','before','mysql-ha/backend-dns',backendAdvice(tools.dnsTool));
 }
 
 export const mysqlHaWorkflow = create();

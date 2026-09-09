@@ -257,3 +257,21 @@ launchers only from a clean, pushed HEAD.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Compute, SSH keys, and R2/S3 remote state now come from the pinned
+[colors-compute library](https://github.com/getcolors/colors-compute). The package
+declares three peer nodes and its network requirements; the library provisions
+shared resources once, fans out node operations, and joins observed outputs for
+Ansible. Provider options and credentials follow that library revision. Compatible
+provider additions require dependency changes only.
+
+Existing monolithic compute state requires an explicit migration. The library
+refuses to adopt it automatically. Managed keys use the profile identity;
+external keys require their private identity path. S3 state uses ambient AWS
+credentials; R2 state uses `COLORS_PAR_R2_ACCESS_KEY_ID` and
+`COLORS_PAR_R2_SECRET_ACCESS_KEY`.
+
+The selected provider must support an application-assigned reserved IP. The
+library supplies the endpoint agent, while MySQL retains its primary/read-write
+checks. Infrastructure convergence never assigns the endpoint back to a fixed
+member.

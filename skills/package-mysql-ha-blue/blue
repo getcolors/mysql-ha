@@ -1,9 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["package-mysql-ha-blue", "blue"]
+# dependencies = ["package-mysql-ha-blue", "blue", "colors-compute-blue"]
 #
 # [tool.uv.sources]
+# colors-compute-blue = { git = "https://github.com/getcolors/colors-compute.git", rev = "85bf076dfe2c34025dc9362f1cc4c5bc92a4373d", subdirectory = "blue" }
 # package-mysql-ha-blue = { git = "https://github.com/getcolors/mysql-ha.git", rev = "703b2204f73f696243765a8571e39ab58a0ff9cb", subdirectory = "blue" }
 # blue = { git = "https://github.com/getcolors/blue.git", rev = "290f313ead5ca162875c33a049c880da017eae09" }
 #

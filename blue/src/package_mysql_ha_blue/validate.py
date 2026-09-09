@@ -1,22 +1,4 @@
-"""The provider registry and the desired-state rules it drives — the port of
-io.github.getcolors.mysql-ha.validate.
-
-The compute registry is package-owned — this package ships its own
-multi-node DigitalOcean template — and the operations over it are ONCE's
-``compute_cluster`` module, the one implementation of the Compute Cluster
-Standard: selection, the required keys, the source lists, the provider
-rules, the network mode and the topology are checked there over ``spec``,
-never copied here. What stays here is what only this package knows: the
-fixed member count, the discovered VPC, and every MySQL rule.
-
-Two credentials reach MySQL — the admin password and the replication
-password — and the design is built to need no third. Nothing in here invents
-one.
-
-Green renders its keys as Clojure keywords, so every message here carries the
-same leading colon — the three colours must report identical errors for one
-colors.yml.
-"""
+"""Application facts derived from the shared compute library."""
 
 from __future__ import annotations
 
@@ -25,54 +7,16 @@ import re
 
 from blue import providers as provider_ops
 from blue.cli import par_name
-from package_once_blue import compute as once_compute
-from package_once_blue import compute_cluster as cluster
-from package_once_blue import ssh as once_ssh
+from colors_compute import validate as compute_validate
+from colors_compute.contract import registry
+from colors_compute.planning import plan_deployment
+from colors_compute.ssh import _mode
+from colors_compute.deployment_request import source_cidrs
+from . import compute, utils
 
-from . import utils
+compute_providers = registry()['compute']
+default_compute_provider = 'digitalocean'
 
-# provider-compute -> what that choice implies.
-#
-# `required` are non-secret keys the template interpolates. `secrets` arrive
-# only through `COLORS_PAR_*`. `tofu-env` is the subset OpenTofu reads
-# natively from the process environment, so a credential never has to be
-# rendered into a .tf file sitting in the work directory in plaintext.
-# `network` is discovered: the region's default VPC, never one this package
-# owns. `digitalocean-ssh-keys` is deliberately absent from `required`: per the
-# SSH Keypair Standard its absence selects keygen mode, and its presence is the
-# opt-out that passes the operator's key ids through untouched.
-compute_providers = {
-    "digitalocean": {
-        "required": ["digitalocean-name", "digitalocean-region",
-                     "digitalocean-size", "digitalocean-image",
-                     "digitalocean-vpc-mode"],
-        "secrets": ["do-token"],
-        "tofu-env": {"do-token": "DIGITALOCEAN_TOKEN"},
-        "network": {"mode": "discovered"},
-    },
-}
-
-# The provider a deployment created before this package recorded one in its
-# compute output must be running: the only one it ever offered.
-default_compute_provider = "digitalocean"
-
-# How this package describes itself to ONCE's `compute_cluster`. One
-# homogeneous role of `cluster-nodes` members, whose fallback addresses start
-# at offset 11 so that `build` renders the same 192.0.2.11-13 and
-# 10.110.0.11-13 it always did, with 192.0.2.10 left to the reserved IP. The
-# fallback subnet stands in for the discovered VPC's range on a build; on a
-# real run the range is the compute state's `vpc_ip_range`.
-spec: cluster.ClusterSpec = {
-    "registry": compute_providers,
-    "default": default_compute_provider,
-    "sources": {"non_empty": ["ssh-sources", "client-sources"], "may_be_empty": []},
-    "roles": [{"role": None, "count_key": "cluster-nodes", "count": 3, "fallback_offset": 11}],
-    "fallback_subnet": "10.110.0.0/20",
-}
-
-# Provider slot -> provider name -> what that choice implies. The compute slot
-# is the registry above, so the OpenTofu environment and the secrets are read
-# from one place whichever slot a stage asks for.
 providers = {
     "provider-compute": compute_providers,
 
@@ -84,18 +28,7 @@ providers = {
         },
     },
 
-    "provider-backend": {
-        "local": {"required": [], "secrets": [], "tofu-env": {}},
-        "s3": {"required": ["s3-bucket", "s3-region"], "secrets": [], "tofu-env": {}},
-        # R2 is S3-compatible, so it authenticates through the AWS chain. Naming
-        # the keys in backend.tf.json would also copy them into .terraform/.
-        "r2": {
-            "required": ["r2-bucket", "r2-endpoint"],
-            "secrets": ["r2-access-key-id", "r2-secret-access-key"],
-            "tofu-env": {"r2-access-key-id": "AWS_ACCESS_KEY_ID",
-                         "r2-secret-access-key": "AWS_SECRET_ACCESS_KEY"},
-        },
-    },
+    "provider-backend": registry()['backend'],
 }
 
 slots = ["provider-compute", "provider-dns", "provider-backend"]
@@ -106,7 +39,6 @@ own_slots = ["provider-dns", "provider-backend"]
 own_required = [
     "profile", "workdir",
     "cluster-host", "cluster-nodes",
-    "digitalocean-ssh-sources", "digitalocean-client-sources",
     "cloudflare-proxied",
     "mysql-port", "mysql-group-port", "mysql-group-name",
     "mysql-admin-user", "mysql-replication-user",
@@ -133,10 +65,8 @@ def placeholder(x) -> bool:
 
 
 def keygen(opts: dict) -> bool:
-    """Whether this deployment owns its machine keypair: `digitalocean-ssh-keys`
-    is absent. Delegates to ONCE, the standard's reference implementation, so
-    one rule decides it everywhere."""
-    return once_ssh.keygen(opts)
+    """Application facts derived from the shared compute library."""
+    return _mode(opts)['mode'] == 'managed'
 
 
 profile_par = par_name("profile")
@@ -179,15 +109,10 @@ def _pr_str(x) -> str:
 
 
 def state_errors(opts: dict) -> list[str]:
-    """Everything wrong with `opts` that does not depend on a credential.
-    Empty means the desired state renders. The missing keys are this
-    package's, the selected compute provider's (ONCE's `required_keys`) and
-    the other slots'; the package's own rules follow; the Compute Cluster
-    Standard's — selection, the source lists, the provider and network rules,
-    the topology — are ONCE's over `spec` and come last."""
+    """Application facts derived from the shared compute library."""
     errors: list[str] = []
     for key in _missing(opts, [*own_required,
-                               *once_compute.required_keys(spec, opts),
+
                                *_slot_keys(opts, own_slots, "required")]):
         errors.append(f":{key} is required")
     for slot in own_slots:
@@ -210,12 +135,15 @@ def state_errors(opts: dict) -> list[str]:
     # Opt-out mode reaches the members with the operator's own key, so the
     # path to it is desired state there; keygen mode names the generated key
     # itself and must not be asked for one.
-    if not keygen(opts) and placeholder(opts.get("digitalocean-ssh-private-key")):
-        errors.append(":digitalocean-ssh-private-key is required when digitalocean-ssh-keys is supplied")
+    try:
+        mode = _mode(opts)
+    except ValueError as error:
+        errors.append(str(error))
+        mode = {}
+    if mode.get('mode') == 'external' and not mode.get('private_key_path'):
+        errors.append(':ssh-private-key-path is required for external SSH access')
     if opts.get("cluster-nodes") != 3:
         errors.append(":cluster-nodes must be 3; a Group Replication majority needs an odd group and the budget is three droplets")
-    if opts.get("digitalocean-vpc-mode") != "default":
-        errors.append(":digitalocean-vpc-mode must be default; the VPC is discovered at run time and is never desired state")
     if not (placeholder(opts.get("mysql-group-name"))
             or UUID_RE.fullmatch(str(opts.get("mysql-group-name")))):
         errors.append(":mysql-group-name must be a UUID; MySQL rejects anything else as a group name")
@@ -239,7 +167,12 @@ def state_errors(opts: dict) -> list[str]:
             and not placeholder(opts.get("r2-bucket"))
             and str(opts.get("backup-r2-bucket")) == str(opts.get("r2-bucket"))):
         errors.append(":backup-r2-bucket must not be the state bucket")
-    errors.extend(cluster.state_errors(spec, opts))
+    errors.extend(compute_validate(opts))
+    if not errors:
+        try:
+            plan_deployment(opts, compute.topology(opts), compute.requirements(opts))
+        except ValueError as error:
+            errors.append(str(error))
     return errors
 
 
@@ -249,8 +182,8 @@ def secret_errors(opts: dict) -> list[str]:
     `health` reads remote state and talks to the nodes over SSH; every MySQL
     query it makes runs on the node against its local socket, so it needs the
     provider credentials and none of the database ones."""
-    keys = (_slot_keys(opts, slots, "secrets")
+    keys = (_slot_keys(opts, own_slots, "secrets")
             if opts.get("blue/event") == "health"
-            else [*_slot_keys(opts, slots, "secrets"), *own_secrets])
+            else [*_slot_keys(opts, own_slots, "secrets"), *own_secrets])
     return [f"required credential is not set: {par_name(key)}"
             for key in dict.fromkeys(_missing(opts, keys))]

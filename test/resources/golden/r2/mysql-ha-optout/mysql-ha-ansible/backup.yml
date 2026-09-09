@@ -18,14 +18,15 @@
     # These three files are the only place a credential lands on a member, and
     # none of them is ever rendered into the work directory: they are built
     # here from the process environment under no_log.
-    - name: Install the DigitalOcean token the endpoint agent needs
+    - name: Install the endpoint adapter credentials
       ansible.builtin.copy:
         dest: /etc/mysql-ha/secrets.env
         owner: root
         group: root
         mode: "0600"
         content: |
-          DO_TOKEN={{ lookup('env', 'COLORS_PAR_DO_TOKEN') }}
+          export COLORS_PAR_DO_TOKEN={{ lookup('env', 'COLORS_PAR_DO_TOKEN') | quote }}
+
       no_log: true
 
     - name: Install the backup-bucket rclone remote
@@ -80,6 +81,7 @@
         group: root
         mode: "0750"
       loop:
+        - colors-compute-endpoint
         - mysql-ha-endpoint
         - mysql-ha-heartbeat
         - mysql-ha-snapshot

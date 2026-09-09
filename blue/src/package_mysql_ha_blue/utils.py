@@ -26,17 +26,6 @@ def ordinals(opts: dict) -> list[int]:
     return list(range(1, node_count(opts) + 1))
 
 
-def node_name(opts: dict, ordinal: int) -> str:
-    """The DigitalOcean droplet name for member `ordinal`, and the Ansible
-    inventory host alias. One name, so a droplet in the console and a host in
-    a play recap are obviously the same thing."""
-    return f"{opts.get('digitalocean-name')}-node-{ordinal}"
-
-
-def node_names(opts: dict) -> list[str]:
-    return [node_name(opts, ordinal) for ordinal in ordinals(opts)]
-
-
 def server_id(ordinal: int) -> int:
     """MySQL `server_id`. Distinct per member and stable across rebuilds,
     because it is derived from the ordinal rather than from an address."""

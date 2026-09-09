@@ -1,5 +1,6 @@
 {:paths ["src/clj" "src/resources"]
- :deps {org.clojure/clojure       {:mvn/version "1.12.5"}
+ :deps {io.github.getcolors/colors-compute {:git/url "https://github.com/getcolors/colors-compute.git" :git/sha "85bf076dfe2c34025dc9362f1cc4c5bc92a4373d" :deps/root "green"}
+        org.clojure/clojure       {:mvn/version "1.12.5"}
         io.github.getcolors/green {:git/url "https://github.com/getcolors/green.git"
                                    :git/sha "3f33f5d4dcce1f8d97a11b6972e13eb3f0b37654"}
         ;; The two pins move together. Green 3f33f5d is where the SDK reports a
