@@ -5,7 +5,7 @@
 #
 # [tool.uv.sources]
 # colors-compute-blue = { git = "https://github.com/getcolors/colors-compute.git", rev = "ae28ea74962bb1897fa6365c143c1d43ac1fe095", subdirectory = "blue" }
-# package-mysql-ha-blue = { git = "https://github.com/getcolors/mysql-ha.git", rev = "e3bb7e5cc15b58acd1d581af2302f9fefd6233ee", subdirectory = "blue" }
+# package-mysql-ha-blue = { git = "https://github.com/getcolors/mysql-ha.git", rev = "8c40ef1c016a00e0d97cde435c9b8190ed4a972d", subdirectory = "blue" }
 # blue = { git = "https://github.com/getcolors/blue.git", rev = "290f313ead5ca162875c33a049c880da017eae09" }
 #
 # [tool.uv]
