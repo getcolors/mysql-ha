@@ -77,8 +77,12 @@ and the selected identity path.
 
 Manifests and lockfiles pin published dependencies. Publish package source before
 running `bb pin` in `green/`, then publish the stamped launcher copies. Red
-launchers resolve compute and SDK transitively through the pinned package;
-repeating these Git dependencies breaks cold installation in Bun 1.3.13.
+launchers resolve compute through the pinned package and pin the Red SDK
+explicitly in `PINS` at the commit `red/package.json` pins, because
+colors-compute-red declares the SDK as a peer and a cold cache installs nothing
+for a peer; `scripts/launcher.sh` checks the two agree and builds the payload
+from an empty cache. Do not repeat one Git dependency at two depths: Bun fails
+to resolve it.
 
 The library creates the reserved IP without assigning it to a node and supplies
 the endpoint agent. MySQL retains the ONLINE/PRIMARY/read-write eligibility gates
